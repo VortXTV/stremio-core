@@ -168,20 +168,29 @@ pub struct MetaItemPreview {
 
 impl From<MetaItemPreviewLegacy> for MetaItemPreview {
     fn from(legacy_item: MetaItemPreviewLegacy) -> Self {
+        let id = legacy_item.id.to_owned();
+        let r#type = legacy_item.r#type.to_owned();
+        let imdb_link = legacy_item.imdb_rating.map(|imdb_rating| Link {
+            name: imdb_rating,
+            category: IMDB_LINK_CATEGORY.to_owned(),
+            url: IMDB_URL
+                .join(&format!("{IMDB_TITLE_PATH}/"))
+                .expect("IMDB url build failed")
+                .join(&utf8_percent_encode(&id, URI_COMPONENT_ENCODE_SET).to_string())
+                .expect("IMDB url build failed"),
+        });
         let links = match legacy_item.links {
-            Some(links) => links,
+            // An addon that sends both `imdbRating` and its own `links` (without an imdb
+            // entry) would otherwise lose the rating entirely: the canonical struct carries
+            // the rating only as an imdb-category link, so synthesize and prepend it.
+            Some(links) => {
+                if links.iter().any(|link| link.category == IMDB_LINK_CATEGORY) {
+                    links
+                } else {
+                    imdb_link.into_iter().chain(links).collect()
+                }
+            }
             _ => {
-                let id = legacy_item.id.to_owned();
-                let r#type = legacy_item.r#type.to_owned();
-                let imdb_link = legacy_item.imdb_rating.map(|imdb_rating| Link {
-                    name: imdb_rating,
-                    category: IMDB_LINK_CATEGORY.to_owned(),
-                    url: IMDB_URL
-                        .join(&format!("{IMDB_TITLE_PATH}/"))
-                        .expect("IMDB url build failed")
-                        .join(&utf8_percent_encode(&id, URI_COMPONENT_ENCODE_SET).to_string())
-                        .expect("IMDB url build failed"),
-                });
                 let genres_links = legacy_item.genres.into_iter().map(|genre| {
                     let deep_links = DiscoverDeepLinks::from(&ResourceRequest {
                         base: CINEMETA_URL.to_owned(),
@@ -482,5 +491,74 @@ mod tests {
                 .map(|video| video.id.as_str()),
             None
         );
+    }
+
+    #[test]
+    fn imdb_rating_preserved_when_addon_sends_own_links() {
+        let preview = serde_json::from_value::<MetaItemPreview>(serde_json::json!({
+            "id": "tt1254207",
+            "type": "movie",
+            "name": "Big Buck Bunny",
+            "imdbRating": "7.8",
+            "links": [
+                { "name": "Comedy", "category": "Genres", "url": "https://example.com/genre/comedy" },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            preview.links.len(),
+            2,
+            "synthesized imdb link should be prepended to the addon links"
+        );
+        assert_eq!(preview.links[0].category, IMDB_LINK_CATEGORY);
+        assert_eq!(preview.links[0].name, "7.8");
+        assert_eq!(
+            preview.links[0].url.as_str(),
+            "https://imdb.com/title/tt1254207"
+        );
+        assert_eq!(preview.links[1].category, GENRES_LINK_CATEGORY);
+        assert_eq!(preview.links[1].name, "Comedy");
+    }
+
+    #[test]
+    fn imdb_link_from_addon_links_kept_without_duplicate() {
+        let preview = serde_json::from_value::<MetaItemPreview>(serde_json::json!({
+            "id": "tt1254207",
+            "type": "movie",
+            "name": "Big Buck Bunny",
+            "imdbRating": "7.8",
+            "links": [
+                { "name": "8.1", "category": "imdb", "url": "https://imdb.com/title/tt1254207" },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            preview.links.len(),
+            1,
+            "an addon-provided imdb link should be kept verbatim, not duplicated"
+        );
+        assert_eq!(preview.links[0].category, IMDB_LINK_CATEGORY);
+        assert_eq!(preview.links[0].name, "8.1");
+    }
+
+    #[test]
+    fn imdb_and_genres_links_synthesized_without_addon_links() {
+        let preview = serde_json::from_value::<MetaItemPreview>(serde_json::json!({
+            "id": "tt1254207",
+            "type": "movie",
+            "name": "Big Buck Bunny",
+            "imdbRating": "7.8",
+            "genres": ["Comedy"],
+        }))
+        .unwrap();
+        assert_eq!(preview.links.len(), 2);
+        assert_eq!(preview.links[0].category, IMDB_LINK_CATEGORY);
+        assert_eq!(preview.links[0].name, "7.8");
+        assert_eq!(
+            preview.links[0].url.as_str(),
+            "https://imdb.com/title/tt1254207"
+        );
+        assert_eq!(preview.links[1].category, GENRES_LINK_CATEGORY);
+        assert_eq!(preview.links[1].name, "Comedy");
     }
 }
