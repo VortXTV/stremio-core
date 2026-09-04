@@ -37,10 +37,26 @@ pub enum ActionCtx {
     Logout,
     DeleteAccount(Password),
     InstallAddon(Descriptor),
+    /// Installs an addon in this profile without updating the authenticated Stremio addon collection.
+    InstallAddonLocal(Descriptor),
     InstallTraktAddon,
     LogoutTrakt,
     UpgradeAddon(Descriptor),
+    /// Upgrades an addon in this profile without updating the authenticated Stremio addon collection.
+    UpgradeAddonLocal(Descriptor),
     UninstallAddon(Descriptor),
+    /// Uninstalls an addon in this profile without updating the authenticated Stremio addon collection.
+    UninstallAddonLocal(Descriptor),
+    /// Replaces an installed addon with a new descriptor in one profile mutation.
+    ReplaceAddon {
+        old: Descriptor,
+        new: Descriptor,
+    },
+    /// Replaces an installed addon locally without updating the authenticated Stremio addon collection.
+    ReplaceAddonLocal {
+        old: Descriptor,
+        new: Descriptor,
+    },
     UpdateSettings(ProfileSettings),
     AddToLibrary(MetaItemPreview),
     RemoveFromLibrary(String),
