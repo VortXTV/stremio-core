@@ -333,50 +333,156 @@ fn actionctx_normal_upgrade_still_pushes_authenticated_collection() {
 }
 
 #[test]
-fn actionctx_local_addon_guards_leave_authenticated_profile_unchanged() {
+fn actionctx_local_mutations_bypass_remote_lock_and_persist_without_collection_writes() {
     let installed = addon("https://installed.example/manifest.json", 1);
-    let missing = addon("https://missing.example/manifest.json", 1);
-    let mut required = addon("https://required.example/manifest.json", 1);
-    required.manifest.behavior_hints.configuration_required = true;
+    let upgraded = addon("https://installed.example/manifest.json", 2);
+    let replacement = addon("https://replacement.example/manifest.json", 1);
 
+    let _env_mutex = TestEnv::reset().unwrap();
+    let mut profile = authenticated_profile(vec![]);
+    profile.addons_locked = true;
+    let (runtime, rx) = new_runtime(profile, StreamsBucket::default());
+    let runtime = Arc::new(RwLock::new(runtime));
+
+    TestEnv::run_with_runtime(rx, runtime.clone(), {
+        let runtime = runtime.clone();
+        let installed = installed.clone();
+        let upgraded = upgraded.clone();
+        let replacement = replacement.clone();
+        move || {
+            for action in [
+                ActionCtx::InstallAddonLocal(installed),
+                ActionCtx::UpgradeAddonLocal(upgraded),
+                ActionCtx::ReplaceAddonLocal {
+                    old: addon("https://installed.example/manifest.json", 2),
+                    new: replacement.clone(),
+                },
+                ActionCtx::UninstallAddonLocal(replacement),
+            ] {
+                runtime.read().unwrap().dispatch(RuntimeAction {
+                    field: None,
+                    action: Action::Ctx(action),
+                });
+            }
+        }
+    });
+
+    assert!(runtime
+        .read()
+        .unwrap()
+        .model()
+        .unwrap()
+        .ctx
+        .profile
+        .addons
+        .is_empty());
+    assert!(STORAGE
+        .read()
+        .unwrap()
+        .get(PROFILE_STORAGE_KEY)
+        .is_some_and(|data| serde_json::from_str::<Profile>(data)
+            .unwrap()
+            .addons
+            .is_empty()));
+    assert!(REQUESTS.read().unwrap().is_empty());
+    assert_eq!(
+        EVENTS
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event
+                        .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                        .unwrap(),
+                    RuntimeEvent::CoreEvent(
+                        crate::runtime::msg::Event::AddonInstalled { .. }
+                            | crate::runtime::msg::Event::AddonUpgraded { .. }
+                            | crate::runtime::msg::Event::AddonUninstalled { .. }
+                    )
+                )
+            })
+            .count(),
+        4
+    );
+    let events = EVENTS.read().unwrap();
+    assert!(events.iter().any(|event| {
+        matches!(
+            event
+                .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                .unwrap(),
+            RuntimeEvent::CoreEvent(crate::runtime::msg::Event::AddonInstalled {
+                transport_url,
+                id,
+            }) if transport_url == &installed.transport_url && id == &installed.manifest.id
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event
+                .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                .unwrap(),
+            RuntimeEvent::CoreEvent(crate::runtime::msg::Event::AddonUpgraded {
+                transport_url,
+                id,
+            }) if transport_url == &upgraded.transport_url && id == &upgraded.manifest.id
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event
+                .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                .unwrap(),
+            RuntimeEvent::CoreEvent(crate::runtime::msg::Event::AddonUpgraded {
+                transport_url,
+                id,
+            }) if transport_url == &replacement.transport_url && id == &replacement.manifest.id
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event
+                .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                .unwrap(),
+            RuntimeEvent::CoreEvent(crate::runtime::msg::Event::AddonUninstalled {
+                transport_url,
+                id,
+            }) if transport_url == &replacement.transport_url && id == &replacement.manifest.id
+        )
+    }));
+}
+
+#[test]
+fn actionctx_remote_mutations_remain_blocked_while_addons_are_locked() {
+    let installed = addon("https://installed.example/manifest.json", 1);
+    let updated = addon("https://installed.example/manifest.json", 2);
+    let missing = addon("https://missing.example/manifest.json", 1);
+    let replacement = addon("https://replacement.example/manifest.json", 1);
     let _env_mutex = TestEnv::reset().unwrap();
     let mut profile = authenticated_profile(vec![installed.clone()]);
     profile.addons_locked = true;
     let (runtime, _rx) = new_runtime(profile, StreamsBucket::default());
-    TestEnv::run(|| {
-        runtime.dispatch(RuntimeAction {
-            field: None,
-            action: Action::Ctx(ActionCtx::InstallAddonLocal(missing.clone())),
-        });
-    });
-    assert_eq!(
-        runtime.model().unwrap().ctx.profile.addons,
-        vec![installed.clone()]
-    );
-    assert!(REQUESTS.read().unwrap().is_empty());
 
-    drop(_env_mutex);
-    let _env_mutex = TestEnv::reset().unwrap();
-    let (runtime, _rx) = new_runtime(
-        authenticated_profile(vec![installed.clone()]),
-        StreamsBucket::default(),
-    );
     TestEnv::run(|| {
-        runtime.dispatch(RuntimeAction {
-            field: None,
-            action: Action::Ctx(ActionCtx::InstallAddonLocal(installed.clone())),
-        });
-        runtime.dispatch(RuntimeAction {
-            field: None,
-            action: Action::Ctx(ActionCtx::InstallAddonLocal(required)),
-        });
-        runtime.dispatch(RuntimeAction {
-            field: None,
-            action: Action::Ctx(ActionCtx::UninstallAddonLocal(missing)),
-        });
+        for action in [
+            ActionCtx::InstallAddon(missing),
+            ActionCtx::UpgradeAddon(updated),
+            ActionCtx::UninstallAddon(installed.clone()),
+            ActionCtx::ReplaceAddon {
+                old: installed.clone(),
+                new: replacement,
+            },
+        ] {
+            runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::Ctx(action),
+            });
+        }
     });
+
     assert_eq!(runtime.model().unwrap().ctx.profile.addons, vec![installed]);
     assert!(REQUESTS.read().unwrap().is_empty());
+    assert!(STORAGE.read().unwrap().get(PROFILE_STORAGE_KEY).is_none());
 }
 
 #[test]

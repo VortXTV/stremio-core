@@ -388,12 +388,16 @@ fn addon_remote_write_effects<E: Env + 'static>(
     }
 }
 
+fn addons_are_locked_for(remote_write: AddonRemoteWrite, profile: &Profile) -> bool {
+    profile.addons_locked && remote_write == AddonRemoteWrite::Enabled
+}
+
 fn install_addon<E: Env + 'static>(
     profile: &mut Profile,
     addon: &Descriptor,
     remote_write: AddonRemoteWrite,
 ) -> Effects {
-    if profile.addons_locked {
+    if addons_are_locked_for(remote_write, profile) {
         return addon_install_error_effects(addon, OtherError::UserAddonsAreLocked);
     }
 
@@ -428,7 +432,7 @@ fn uninstall_addon<E: Env + 'static>(
     addon: &Descriptor,
     remote_write: AddonRemoteWrite,
 ) -> Effects {
-    if profile.addons_locked {
+    if addons_are_locked_for(remote_write, profile) {
         return addon_uninstall_error_effects(addon, OtherError::UserAddonsAreLocked);
     }
 
@@ -466,7 +470,7 @@ fn upgrade_addon<E: Env + 'static>(
     addon: &Descriptor,
     remote_write: AddonRemoteWrite,
 ) -> Effects {
-    if profile.addons_locked {
+    if addons_are_locked_for(remote_write, profile) {
         return addon_upgrade_error_effects(addon, OtherError::UserAddonsAreLocked);
     }
 
@@ -504,7 +508,7 @@ fn replace_addon<E: Env + 'static>(
     new: &Descriptor,
     remote_write: AddonRemoteWrite,
 ) -> Effects {
-    if profile.addons_locked {
+    if addons_are_locked_for(remote_write, profile) {
         return addon_upgrade_error_effects(new, OtherError::UserAddonsAreLocked);
     }
     if new.manifest.behavior_hints.configuration_required {
