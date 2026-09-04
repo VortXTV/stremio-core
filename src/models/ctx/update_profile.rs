@@ -162,6 +162,9 @@ pub fn update_profile<E: Env + 'static>(
         Msg::Action(Action::Ctx(ActionCtx::ReplaceAddonLocal { old, new })) => {
             replace_addon::<E>(profile, streams, old, new, AddonRemoteWrite::Disabled)
         }
+        Msg::Action(Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(addons))) => {
+            replace_addon_projection_local(profile, streams, addons)
+        }
         Msg::Internal(Internal::UninstallAddon(addon)) => {
             uninstall_addon::<E>(profile, streams, addon, AddonRemoteWrite::Enabled)
         }
@@ -552,6 +555,66 @@ fn replace_addon<E: Env + 'static>(
     }))
     .join(addon_remote_write_effects::<E>(profile, remote_write))
     .join(Effects::msg(Msg::Internal(Internal::ProfileChanged)));
+
+    if streams_changed {
+        effects.join(Effects::msg(Msg::Internal(Internal::StreamsChanged(false))))
+    } else {
+        effects
+    }
+}
+
+fn replace_addon_projection_local(
+    profile: &mut Profile,
+    streams: &mut StreamsBucket,
+    addons: &[Descriptor],
+) -> Effects {
+    let mut projected_transport_urls = profile
+        .addons
+        .iter()
+        .filter(|addon| addon.flags.protected)
+        .map(|addon| addon.transport_url.to_owned())
+        .collect::<HashSet<_>>();
+    let mut next_addons = profile
+        .addons
+        .iter()
+        .filter(|addon| addon.flags.protected)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    next_addons.extend(addons.iter().filter_map(|addon| {
+        (!addon.flags.protected
+            && !addon.manifest.behavior_hints.configuration_required
+            && projected_transport_urls.insert(addon.transport_url.to_owned()))
+        .then(|| addon.to_owned())
+    }));
+
+    let previous_transport_urls = profile
+        .addons
+        .iter()
+        .map(|addon| addon.transport_url.to_owned())
+        .collect::<HashSet<_>>();
+    let next_transport_urls = next_addons
+        .iter()
+        .map(|addon| addon.transport_url.to_owned())
+        .collect::<HashSet<_>>();
+    let transport_urls = (&next_transport_urls - &previous_transport_urls)
+        .into_iter()
+        .chain(&previous_transport_urls - &next_transport_urls)
+        .collect();
+
+    if profile.addons == next_addons {
+        return Effects::msg(Msg::Event(Event::AddonsPulledFromAPI { transport_urls })).unchanged();
+    }
+
+    profile.addons = next_addons;
+    let streams_changed = streams.items.len();
+    streams
+        .items
+        .retain(|_key, stream| next_transport_urls.contains(&stream.stream_transport_url));
+    let streams_changed = streams_changed != streams.items.len();
+
+    let effects = Effects::msg(Msg::Event(Event::AddonsPulledFromAPI { transport_urls }))
+        .join(Effects::msg(Msg::Internal(Internal::ProfileChanged)));
 
     if streams_changed {
         effects.join(Effects::msg(Msg::Internal(Internal::StreamsChanged(false))))

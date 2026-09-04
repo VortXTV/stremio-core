@@ -1,4 +1,4 @@
-use crate::constants::PROFILE_STORAGE_KEY;
+use crate::constants::{PROFILE_STORAGE_KEY, STREAMS_STORAGE_KEY};
 use crate::models::ctx::Ctx;
 use crate::runtime::msg::{Action, ActionCtx};
 use crate::runtime::{Env, EnvFutureExt, Runtime, RuntimeAction, RuntimeEvent, TryEnvFuture};
@@ -167,6 +167,13 @@ fn actionctx_local_addon_actions_deserialize() {
     }))
     .unwrap();
     assert!(matches!(parsed, ActionCtx::ReplaceAddonLocal { .. }));
+
+    let parsed = serde_json::from_value::<ActionCtx>(serde_json::json!({
+        "action": "ReplaceAddonProjectionLocal",
+        "args": [descriptor],
+    }))
+    .unwrap();
+    assert!(matches!(parsed, ActionCtx::ReplaceAddonProjectionLocal(_)));
 }
 
 #[test]
@@ -483,6 +490,147 @@ fn actionctx_remote_mutations_remain_blocked_while_addons_are_locked() {
     assert_eq!(runtime.model().unwrap().ctx.profile.addons, vec![installed]);
     assert!(REQUESTS.read().unwrap().is_empty());
     assert!(STORAGE.read().unwrap().get(PROFILE_STORAGE_KEY).is_none());
+}
+
+#[test]
+fn actionctx_local_addon_projection_replaces_unprotected_addons_without_remote_write() {
+    let mut protected = addon("https://protected.example/manifest.json", 1);
+    protected.flags.protected = true;
+    let old = addon("https://old.example/manifest.json", 1);
+    let stale = addon("https://stale.example/manifest.json", 1);
+    let replacement = addon("https://replacement.example/manifest.json", 1);
+    let additional = addon("https://additional.example/manifest.json", 1);
+    let duplicate = addon("https://replacement.example/manifest.json", 2);
+    let mut configuration_required = addon("https://required.example/manifest.json", 1);
+    configuration_required
+        .manifest
+        .behavior_hints
+        .configuration_required = true;
+    let mut projected_protected = addon("https://projected-protected.example/manifest.json", 1);
+    projected_protected.flags.protected = true;
+
+    let mut streams = StreamsBucket::default();
+    for (index, addon) in [&protected, &old, &stale].into_iter().enumerate() {
+        let mut item = stream_item(addon);
+        item.meta_id = format!("tt{index}");
+        item.video_id = format!("tt{index}:1:0");
+        streams.items.insert(
+            StreamsItemKey {
+                meta_id: item.meta_id.clone(),
+                video_id: item.video_id.clone(),
+            },
+            item,
+        );
+    }
+
+    let _env_mutex = TestEnv::reset().unwrap();
+    let mut profile = authenticated_profile(vec![old.clone(), protected.clone(), stale.clone()]);
+    profile.addons_locked = true;
+    let (runtime, rx) = new_runtime(profile, streams);
+    let runtime = Arc::new(RwLock::new(runtime));
+    let expected_addons = vec![protected.clone(), replacement.clone(), additional.clone()];
+
+    TestEnv::run_with_runtime(rx, runtime.clone(), {
+        let runtime = runtime.clone();
+        let replacement = replacement.clone();
+        let additional = additional.clone();
+        move || {
+            runtime.read().unwrap().dispatch(RuntimeAction {
+                field: None,
+                action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![
+                    replacement.clone(),
+                    duplicate,
+                    configuration_required,
+                    projected_protected,
+                    additional.clone(),
+                ])),
+            });
+        }
+    });
+
+    let model = runtime.read().unwrap();
+    assert_eq!(model.model().unwrap().ctx.profile.addons, expected_addons);
+    assert!(model.model().unwrap().ctx.profile.addons_locked);
+    assert_eq!(model.model().unwrap().ctx.streams.items.len(), 1);
+    assert!(model
+        .model()
+        .unwrap()
+        .ctx
+        .streams
+        .items
+        .values()
+        .all(|item| item.stream_transport_url == protected.transport_url));
+    drop(model);
+
+    assert!(REQUESTS.read().unwrap().is_empty());
+    assert_eq!(
+        serde_json::from_str::<Profile>(STORAGE.read().unwrap().get(PROFILE_STORAGE_KEY).unwrap(),)
+            .unwrap()
+            .addons,
+        expected_addons
+    );
+    assert_eq!(
+        serde_json::from_str::<StreamsBucket>(
+            STORAGE.read().unwrap().get(STREAMS_STORAGE_KEY).unwrap(),
+        )
+        .unwrap()
+        .items
+        .len(),
+        1
+    );
+
+    let events = EVENTS.read().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event
+                        .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                        .unwrap(),
+                    RuntimeEvent::CoreEvent(
+                        crate::runtime::msg::Event::ProfilePushedToStorage { .. }
+                    )
+                )
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event
+                        .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                        .unwrap(),
+                    RuntimeEvent::CoreEvent(
+                        crate::runtime::msg::Event::StreamsPushedToStorage { .. }
+                    )
+                )
+            })
+            .count(),
+        1
+    );
+    let projection_events = events
+        .iter()
+        .filter_map(|event| {
+            match event
+                .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                .unwrap()
+            {
+                RuntimeEvent::CoreEvent(crate::runtime::msg::Event::AddonsPulledFromAPI {
+                    transport_urls,
+                }) => Some(transport_urls),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(projection_events.len(), 1);
+    assert_eq!(projection_events[0].len(), 4);
+    for addon in [&old, &stale, &replacement, &additional] {
+        assert!(projection_events[0].contains(&addon.transport_url));
+    }
 }
 
 #[test]

@@ -57,6 +57,8 @@ pub enum ActionCtx {
         old: Descriptor,
         new: Descriptor,
     },
+    /// Atomically projects local non-protected addons without updating the authenticated Stremio addon collection.
+    ReplaceAddonProjectionLocal(Vec<Descriptor>),
     UpdateSettings(ProfileSettings),
     AddToLibrary(MetaItemPreview),
     RemoveFromLibrary(String),
