@@ -248,6 +248,7 @@ fn actionctx_local_install_emits_the_normal_addon_event_without_api_write() {
 fn actionctx_normal_and_local_replace_have_one_or_zero_collection_writes() {
     let old = addon("https://old.example/manifest.json", 1);
     let new = addon("https://new.example/manifest.json", 2);
+    let peer = addon("https://peer.example/manifest.json", 1);
     let mut streams = StreamsBucket::default();
     streams.items.insert(
         StreamsItemKey {
@@ -259,7 +260,10 @@ fn actionctx_normal_and_local_replace_have_one_or_zero_collection_writes() {
 
     let _env_mutex = TestEnv::reset().unwrap();
     *FETCH_HANDLER.write().unwrap() = Box::new(api_success);
-    let (runtime, _rx) = new_runtime(authenticated_profile(vec![old.clone()]), streams.clone());
+    let (runtime, _rx) = new_runtime(
+        authenticated_profile(vec![old.clone(), peer.clone()]),
+        streams.clone(),
+    );
     TestEnv::run(|| {
         runtime.dispatch(RuntimeAction {
             field: None,
@@ -271,15 +275,27 @@ fn actionctx_normal_and_local_replace_have_one_or_zero_collection_writes() {
     });
     assert_eq!(
         runtime.model().unwrap().ctx.profile.addons,
-        vec![new.clone()]
+        vec![new.clone(), peer.clone()]
     );
     assert!(runtime.model().unwrap().ctx.streams.items.is_empty());
     assert_eq!(REQUESTS.read().unwrap().len(), 1);
+    assert_eq!(
+        REQUESTS.read().unwrap()[0].body,
+        format!(
+            "{{\"type\":\"AddonCollectionSet\",\"authKey\":\"auth_key\",\"addons\":[{},{}]}}",
+            serde_json::to_string(&new).unwrap(),
+            serde_json::to_string(&peer).unwrap(),
+        ),
+        "the one remote request must contain the final replacement collection in-place, never an intermediate removal snapshot"
+    );
     assert!(STORAGE.read().unwrap().contains_key(PROFILE_STORAGE_KEY));
 
     drop(_env_mutex);
     let _env_mutex = TestEnv::reset().unwrap();
-    let (runtime, _rx) = new_runtime(authenticated_profile(vec![old.clone()]), streams);
+    let (runtime, _rx) = new_runtime(
+        authenticated_profile(vec![old.clone(), peer.clone()]),
+        streams,
+    );
     TestEnv::run(|| {
         runtime.dispatch(RuntimeAction {
             field: None,
@@ -289,7 +305,7 @@ fn actionctx_normal_and_local_replace_have_one_or_zero_collection_writes() {
             }),
         });
     });
-    assert_eq!(runtime.model().unwrap().ctx.profile.addons, vec![new]);
+    assert_eq!(runtime.model().unwrap().ctx.profile.addons, vec![new, peer]);
     assert!(runtime.model().unwrap().ctx.streams.items.is_empty());
     assert!(REQUESTS.read().unwrap().is_empty());
 }
@@ -360,5 +376,61 @@ fn actionctx_local_addon_guards_leave_authenticated_profile_unchanged() {
         });
     });
     assert_eq!(runtime.model().unwrap().ctx.profile.addons, vec![installed]);
+    assert!(REQUESTS.read().unwrap().is_empty());
+}
+
+#[test]
+fn actionctx_local_replace_guards_leave_authenticated_profile_unchanged() {
+    let old = addon("https://old.example/manifest.json", 1);
+    let new = addon("https://new.example/manifest.json", 2);
+    let missing = addon("https://missing.example/manifest.json", 1);
+    let mut required = addon("https://required.example/manifest.json", 2);
+    required.manifest.behavior_hints.configuration_required = true;
+
+    let _env_mutex = TestEnv::reset().unwrap();
+    let mut protected_old = old.clone();
+    protected_old.flags.protected = true;
+    let (runtime, _rx) = new_runtime(
+        authenticated_profile(vec![protected_old.clone()]),
+        StreamsBucket::default(),
+    );
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Ctx(ActionCtx::ReplaceAddonLocal {
+                old: protected_old.clone(),
+                new: new.clone(),
+            }),
+        });
+    });
+    assert_eq!(
+        runtime.model().unwrap().ctx.profile.addons,
+        vec![protected_old]
+    );
+    assert!(REQUESTS.read().unwrap().is_empty());
+
+    drop(_env_mutex);
+    let _env_mutex = TestEnv::reset().unwrap();
+    let (runtime, _rx) = new_runtime(
+        authenticated_profile(vec![old.clone()]),
+        StreamsBucket::default(),
+    );
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Ctx(ActionCtx::ReplaceAddonLocal {
+                old: missing,
+                new: new.clone(),
+            }),
+        });
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Ctx(ActionCtx::ReplaceAddonLocal {
+                old: old.clone(),
+                new: required,
+            }),
+        });
+    });
+    assert_eq!(runtime.model().unwrap().ctx.profile.addons, vec![old]);
     assert!(REQUESTS.read().unwrap().is_empty());
 }
