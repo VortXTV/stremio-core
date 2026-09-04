@@ -6,7 +6,7 @@ use once_cell::sync::Lazy;
 use percent_encoding::utf8_percent_encode;
 use url::Url;
 
-use crate::addon_transport::http_transport::legacy::AddonLegacyTransport;
+use crate::addon_transport::http_transport::{addon_request, legacy::AddonLegacyTransport};
 use crate::addon_transport::AddonTransport;
 use crate::constants::{
     ADDON_LEGACY_PATH, ADDON_MANIFEST_PATH, CINEMETA_URL, URI_COMPONENT_ENCODE_SET,
@@ -93,7 +93,7 @@ impl<E: Env> AddonTransport for AddonHTTPTransport<E> {
             _ => {}
         }
 
-        let request = Request::get(url).body(()).expect("request builder failed");
+        let request = addon_request(Request::get(url).body(()).expect("request builder failed"));
         E::fetch(request)
     }
     fn manifest(&self) -> TryEnvFuture<Manifest> {
@@ -101,9 +101,11 @@ impl<E: Env> AddonTransport for AddonHTTPTransport<E> {
             return AddonLegacyTransport::<E>::new(&self.transport_url).manifest();
         }
 
-        let request = Request::get(self.transport_url.as_str())
-            .body(())
-            .expect("request builder failed");
+        let request = addon_request(
+            Request::get(self.transport_url.as_str())
+                .body(())
+                .expect("request builder failed"),
+        );
         E::fetch(request)
     }
 }
