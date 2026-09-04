@@ -606,7 +606,10 @@ fn replace_addon_projection_local(
         .collect();
 
     if profile.addons == next_addons {
-        return Effects::msg(Msg::Event(Event::AddonsPulledFromAPI { transport_urls })).unchanged();
+        return Effects::msg(Msg::Event(Event::AddonProjectionReplacedLocal {
+            transport_urls,
+        }))
+        .unchanged();
     }
 
     profile.addons = next_addons;
@@ -616,8 +619,10 @@ fn replace_addon_projection_local(
         .retain(|_key, stream| next_transport_urls.contains(&stream.stream_transport_url));
     let streams_changed = streams_changed != streams.items.len();
 
-    let effects = Effects::msg(Msg::Event(Event::AddonsPulledFromAPI { transport_urls }))
-        .join(Effects::msg(Msg::Internal(Internal::ProfileChanged)));
+    let effects = Effects::msg(Msg::Event(Event::AddonProjectionReplacedLocal {
+        transport_urls,
+    }))
+    .join(Effects::msg(Msg::Internal(Internal::ProfileChanged)));
 
     if streams_changed {
         effects.join(Effects::msg(Msg::Internal(Internal::StreamsChanged(false))))

@@ -1,9 +1,11 @@
 use crate::constants::{PROFILE_STORAGE_KEY, STREAMS_STORAGE_KEY};
 use crate::models::ctx::Ctx;
 use crate::runtime::msg::{Action, ActionCtx};
-use crate::runtime::{Env, EnvFutureExt, Runtime, RuntimeAction, RuntimeEvent, TryEnvFuture};
+use crate::runtime::{
+    Env, EnvError, EnvFutureExt, Runtime, RuntimeAction, RuntimeEvent, TryEnvFuture,
+};
 use crate::types::addon::{Descriptor, Manifest};
-use crate::types::api::{APIResult, SuccessResponse};
+use crate::types::api::{APIResult, CollectionResponse, SuccessResponse};
 use crate::types::events::DismissedEventsBucket;
 use crate::types::library::LibraryBucket;
 use crate::types::notifications::NotificationsBucket;
@@ -16,11 +18,11 @@ use crate::types::True;
 use crate::unit_tests::{
     default_fetch_handler, Request, TestEnv, EVENTS, FETCH_HANDLER, REQUESTS, STORAGE,
 };
-use futures::channel::mpsc::Receiver;
-use futures::future;
+use futures::channel::{mpsc::Receiver, oneshot};
+use futures::{future, TryFutureExt};
 use semver::Version;
 use std::any::Any;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use stremio_derive::Model;
 use url::Url;
 
@@ -614,6 +616,49 @@ fn actionctx_local_addon_projection_replaces_unprotected_addons_without_remote_w
             .count(),
         1
     );
+    assert!(!events.iter().any(|event| matches!(
+        event
+            .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+            .unwrap(),
+        RuntimeEvent::CoreEvent(crate::runtime::msg::Event::AddonsPulledFromAPI { .. })
+    )));
+    let state_position = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event
+                    .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                    .unwrap(),
+                RuntimeEvent::NewState(_, _)
+            )
+        })
+        .unwrap();
+    let receipt_position = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event
+                    .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                    .unwrap(),
+                RuntimeEvent::CoreEvent(
+                    crate::runtime::msg::Event::AddonProjectionReplacedLocal { .. }
+                )
+            )
+        })
+        .unwrap();
+    let storage_position = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event
+                    .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                    .unwrap(),
+                RuntimeEvent::CoreEvent(crate::runtime::msg::Event::ProfilePushedToStorage { .. })
+            )
+        })
+        .unwrap();
+    assert!(state_position < receipt_position);
+    assert!(receipt_position < storage_position);
     let projection_events = events
         .iter()
         .filter_map(|event| {
@@ -621,9 +666,9 @@ fn actionctx_local_addon_projection_replaces_unprotected_addons_without_remote_w
                 .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
                 .unwrap()
             {
-                RuntimeEvent::CoreEvent(crate::runtime::msg::Event::AddonsPulledFromAPI {
-                    transport_urls,
-                }) => Some(transport_urls),
+                RuntimeEvent::CoreEvent(
+                    crate::runtime::msg::Event::AddonProjectionReplacedLocal { transport_urls },
+                ) => Some(transport_urls),
                 _ => None,
             }
         })
@@ -633,6 +678,148 @@ fn actionctx_local_addon_projection_replaces_unprotected_addons_without_remote_w
     for addon in [&old, &stale, &replacement, &additional] {
         assert!(projection_events[0].contains(&addon.transport_url));
     }
+}
+
+#[test]
+fn actionctx_noop_local_projection_emits_only_its_distinct_receipt() {
+    let mut protected = addon("https://protected.example/manifest.json", 1);
+    protected.flags.protected = true;
+    let installed = addon("https://installed.example/manifest.json", 1);
+    let _env_mutex = TestEnv::reset().unwrap();
+    let (runtime, rx) = new_runtime(
+        authenticated_profile(vec![protected, installed.clone()]),
+        StreamsBucket::default(),
+    );
+    let runtime = Arc::new(RwLock::new(runtime));
+
+    TestEnv::run_with_runtime(rx, runtime.clone(), {
+        let runtime = runtime.clone();
+        move || {
+            // The resulting projection is byte-for-byte identical, but this accepted action is still
+            // an owner boundary and therefore produces an unambiguous completion receipt.
+            runtime.read().unwrap().dispatch(RuntimeAction {
+                field: None,
+                action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![installed])),
+            });
+        }
+    });
+
+    assert!(STORAGE.read().unwrap().get(PROFILE_STORAGE_KEY).is_none());
+    let events = EVENTS.read().unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0]
+            .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+            .unwrap(),
+        RuntimeEvent::CoreEvent(
+            crate::runtime::msg::Event::AddonProjectionReplacedLocal { transport_urls }
+        ) if transport_urls.is_empty()
+    ));
+}
+
+#[test]
+fn actionctx_local_projection_rejects_suspended_remote_addon_pull() {
+    let mut protected = addon("https://protected.example/manifest.json", 1);
+    protected.flags.protected = true;
+    let old = addon("https://old.example/manifest.json", 1);
+    let replacement = addon("https://replacement.example/manifest.json", 1);
+
+    let _env_mutex = TestEnv::reset().unwrap();
+    let mut profile = authenticated_profile(vec![protected.clone(), old.clone()]);
+    profile.addons_locked = true;
+
+    let (sender, receiver) = oneshot::channel::<Box<dyn Any + Send>>();
+    let receiver = Arc::new(Mutex::new(Some(receiver)));
+    *FETCH_HANDLER.write().unwrap() = Box::new({
+        let receiver = receiver.clone();
+        move |request| match request {
+            Request {
+                ref url,
+                ref method,
+                ..
+            } if url == "https://api.strem.io/api/addonCollectionGet" && method == "POST" => {
+                receiver
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one suspended add-on pull")
+                    .map_err(|_| EnvError::Other("test response sender dropped".to_owned()))
+                    .boxed_env()
+            }
+            request => default_fetch_handler(request),
+        }
+    });
+
+    let (runtime, rx) = new_runtime(profile, StreamsBucket::default());
+    let runtime = Arc::new(RwLock::new(runtime));
+    TestEnv::run_with_runtime(rx, runtime.clone(), {
+        let runtime = runtime.clone();
+        let replacement = replacement.clone();
+        move || {
+            runtime.read().unwrap().dispatch(RuntimeAction {
+                field: None,
+                action: Action::Ctx(ActionCtx::PullAddonsFromAPI),
+            });
+            runtime.read().unwrap().dispatch(RuntimeAction {
+                field: None,
+                action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![replacement])),
+            });
+            sender
+                .send(Box::new(APIResult::Ok(CollectionResponse {
+                    addons: vec![old],
+                    last_modified: TestEnv::now(),
+                })))
+                .expect("send suspended add-on pull response");
+        }
+    });
+
+    let (addons, addons_locked) = {
+        let runtime = runtime.read().unwrap();
+        let model = runtime.model().unwrap();
+        (
+            model.ctx.profile.addons.clone(),
+            model.ctx.profile.addons_locked,
+        )
+    };
+    assert_eq!(addons, vec![protected.clone(), replacement.clone()]);
+    assert!(addons_locked);
+    assert_eq!(
+        serde_json::from_str::<Profile>(STORAGE.read().unwrap().get(PROFILE_STORAGE_KEY).unwrap())
+            .unwrap()
+            .addons,
+        vec![protected, replacement]
+    );
+    assert_eq!(
+        EVENTS
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(
+                event
+                    .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                    .unwrap(),
+                RuntimeEvent::CoreEvent(crate::runtime::msg::Event::AddonsPulledFromAPI { .. })
+            ))
+            .count(),
+        0,
+        "the stale pull result must not emit a remote collection receipt"
+    );
+    assert_eq!(
+        EVENTS
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(
+                event
+                    .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+                    .unwrap(),
+                RuntimeEvent::CoreEvent(
+                    crate::runtime::msg::Event::AddonProjectionReplacedLocal { .. }
+                )
+            ))
+            .count(),
+        1
+    );
 }
 
 #[test]
