@@ -501,6 +501,7 @@ fn actionctx_local_addon_projection_replaces_unprotected_addons_without_remote_w
     let replacement = addon("https://replacement.example/manifest.json", 1);
     let additional = addon("https://additional.example/manifest.json", 1);
     let duplicate = addon("https://replacement.example/manifest.json", 2);
+    let protected_downgrade = addon("https://protected.example/manifest.json", 2);
     let mut configuration_required = addon("https://required.example/manifest.json", 1);
     configuration_required
         .manifest
@@ -540,6 +541,7 @@ fn actionctx_local_addon_projection_replaces_unprotected_addons_without_remote_w
                 action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![
                     replacement.clone(),
                     duplicate,
+                    protected_downgrade,
                     configuration_required,
                     projected_protected,
                     additional.clone(),
@@ -631,6 +633,46 @@ fn actionctx_local_addon_projection_replaces_unprotected_addons_without_remote_w
     for addon in [&old, &stale, &replacement, &additional] {
         assert!(projection_events[0].contains(&addon.transport_url));
     }
+}
+
+#[test]
+fn actionctx_protected_addon_cannot_be_downgraded_by_local_or_remote_install() {
+    let mut protected = addon("https://protected.example/manifest.json", 1);
+    protected.flags.protected = true;
+    let downgrade = addon("https://protected.example/manifest.json", 2);
+
+    let _env_mutex = TestEnv::reset().unwrap();
+    let mut local_profile = authenticated_profile(vec![protected.clone()]);
+    local_profile.addons_locked = true;
+    let (runtime, _rx) = new_runtime(local_profile, StreamsBucket::default());
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Ctx(ActionCtx::InstallAddonLocal(downgrade.clone())),
+        });
+    });
+    assert_eq!(
+        runtime.model().unwrap().ctx.profile.addons,
+        vec![protected.clone()]
+    );
+    assert!(REQUESTS.read().unwrap().is_empty());
+    assert!(STORAGE.read().unwrap().get(PROFILE_STORAGE_KEY).is_none());
+
+    drop(_env_mutex);
+    let _env_mutex = TestEnv::reset().unwrap();
+    let (runtime, _rx) = new_runtime(
+        authenticated_profile(vec![protected.clone()]),
+        StreamsBucket::default(),
+    );
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Ctx(ActionCtx::InstallAddon(downgrade)),
+        });
+    });
+    assert_eq!(runtime.model().unwrap().ctx.profile.addons, vec![protected]);
+    assert!(REQUESTS.read().unwrap().is_empty());
+    assert!(STORAGE.read().unwrap().get(PROFILE_STORAGE_KEY).is_none());
 }
 
 #[test]

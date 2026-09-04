@@ -416,6 +416,9 @@ fn install_addon<E: Env + 'static>(
         .iter()
         .position(|installed| installed.transport_url == addon.transport_url)
     {
+        if profile.addons[addon_position].flags.protected {
+            return addon_install_error_effects(addon, OtherError::AddonIsProtected);
+        }
         addon.clone_into(&mut profile.addons[addon_position]);
     } else {
         profile.addons.push(addon.to_owned());
