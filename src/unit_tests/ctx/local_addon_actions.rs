@@ -5,7 +5,9 @@ use crate::runtime::{
     Env, EnvError, EnvFutureExt, Runtime, RuntimeAction, RuntimeEvent, TryEnvFuture,
 };
 use crate::types::addon::{Descriptor, Manifest};
-use crate::types::api::{APIResult, CollectionResponse, SuccessResponse};
+use crate::types::api::{
+    APIResult, AuthRequest, AuthResponse, CollectionResponse, LibraryItemsResponse, SuccessResponse,
+};
 use crate::types::events::DismissedEventsBucket;
 use crate::types::library::LibraryBucket;
 use crate::types::notifications::NotificationsBucket;
@@ -820,6 +822,109 @@ fn actionctx_local_projection_rejects_suspended_remote_addon_pull() {
             .count(),
         1
     );
+}
+
+#[test]
+fn actionctx_local_projection_rejects_suspended_auth_with_old_addon_collection() {
+    let mut protected = addon("https://protected.example/manifest.json", 1);
+    protected.flags.protected = true;
+    let old = addon("https://old.example/manifest.json", 1);
+    let replacement = addon("https://replacement.example/manifest.json", 1);
+
+    let _env_mutex = TestEnv::reset().unwrap();
+    let mut profile = authenticated_profile(vec![protected.clone(), old.clone()]);
+    profile.addons_locked = true;
+
+    let (sender, receiver) = oneshot::channel::<Box<dyn Any + Send>>();
+    let receiver = Arc::new(Mutex::new(Some(receiver)));
+    let old_for_fetch = old.clone();
+    *FETCH_HANDLER.write().unwrap() = Box::new({
+        let receiver = receiver.clone();
+        move |request| match request {
+            Request {
+                ref url,
+                ref method,
+                ..
+            } if url == "https://api.strem.io/api/loginWithToken" && method == "POST" => receiver
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one suspended authentication")
+                .map_err(|_| EnvError::Other("test response sender dropped".to_owned()))
+                .boxed_env(),
+            Request {
+                ref url,
+                ref method,
+                ..
+            } if url == "https://api.strem.io/api/addonCollectionGet" && method == "POST" => {
+                future::ok(Box::new(APIResult::Ok(CollectionResponse {
+                    addons: vec![old_for_fetch.clone()],
+                    last_modified: TestEnv::now(),
+                })) as Box<dyn Any + Send>)
+                .boxed_env()
+            }
+            Request {
+                ref url,
+                ref method,
+                ..
+            } if url == "https://api.strem.io/api/datastoreGet" && method == "POST" => future::ok(
+                Box::new(APIResult::Ok(LibraryItemsResponse::new())) as Box<dyn Any + Send>,
+            )
+            .boxed_env(),
+            request => default_fetch_handler(request),
+        }
+    });
+
+    let (runtime, rx) = new_runtime(profile, StreamsBucket::default());
+    let runtime = Arc::new(RwLock::new(runtime));
+    TestEnv::run_with_runtime(rx, runtime.clone(), {
+        let runtime = runtime.clone();
+        let replacement = replacement.clone();
+        move || {
+            runtime.read().unwrap().dispatch(RuntimeAction {
+                field: None,
+                action: Action::Ctx(ActionCtx::Authenticate(AuthRequest::LoginWithToken {
+                    token: "new-owner-token".to_owned(),
+                })),
+            });
+            runtime.read().unwrap().dispatch(RuntimeAction {
+                field: None,
+                action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![replacement])),
+            });
+            sender
+                .send(Box::new(APIResult::Ok(AuthResponse {
+                    key: AuthKey("new_owner_auth_key".to_owned()),
+                    user: User {
+                        id: "new_owner_user_id".into(),
+                        email: "new-owner@example.com".to_owned(),
+                        ..Default::default()
+                    },
+                })))
+                .expect("send suspended authentication response");
+        }
+    });
+
+    let profile = runtime.read().unwrap().model().unwrap().ctx.profile.clone();
+    assert_eq!(profile.addons, vec![protected.clone(), replacement.clone()]);
+    assert_eq!(profile.auth.unwrap().key, AuthKey("auth_key".to_owned()));
+    let stored_profile =
+        serde_json::from_str::<Profile>(STORAGE.read().unwrap().get(PROFILE_STORAGE_KEY).unwrap())
+            .unwrap();
+    assert_eq!(
+        stored_profile.addons,
+        vec![protected.clone(), replacement.clone()]
+    );
+    assert_eq!(
+        stored_profile.auth.unwrap().key,
+        AuthKey("auth_key".to_owned())
+    );
+    assert!(!EVENTS.read().unwrap().iter().any(|event| matches!(
+        event
+            .downcast_ref::<RuntimeEvent<TestEnv, TestModel>>()
+            .unwrap(),
+        RuntimeEvent::CoreEvent(crate::runtime::msg::Event::UserAuthenticated { .. })
+            | RuntimeEvent::CoreEvent(crate::runtime::msg::Event::AddonsPulledFromAPI { .. })
+    )));
 }
 
 #[test]

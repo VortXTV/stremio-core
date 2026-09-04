@@ -9,7 +9,7 @@ use futures::SinkExt;
 use serde::Serialize;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard};
+use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard};
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
 #[serde(tag = "name", content = "args")]
@@ -24,12 +24,25 @@ pub struct RuntimeAction<E: Env, M: Model<E>> {
     pub action: Action,
 }
 
+#[derive(Clone, Copy)]
+struct AddonEffectContext {
+    epoch: u64,
+    fenced: bool,
+}
+
+struct PlannedEffects<F> {
+    effects: Vec<Effect>,
+    fields: Vec<F>,
+    addon_context: AddonEffectContext,
+}
+
 #[derive(Derivative)]
 #[derivative(Clone(bound = ""))]
 pub struct Runtime<E: Env, M: Model<E>> {
     model: Arc<RwLock<M>>,
     tx: Sender<RuntimeEvent<E, M>>,
     addon_epoch: Arc<AtomicU64>,
+    transition: Arc<Mutex<()>>,
     env: PhantomData<E>,
 }
 
@@ -49,32 +62,53 @@ where
             model,
             tx,
             addon_epoch: Arc::new(AtomicU64::new(0)),
+            transition: Arc::new(Mutex::new(())),
             env: PhantomData,
         };
-        runtime.handle_effects(effects, vec![]);
+        {
+            let _transition = runtime.transition.lock().expect("transition lock failed");
+            runtime.handle_effects(PlannedEffects {
+                effects,
+                fields: vec![],
+                addon_context: AddonEffectContext {
+                    epoch: 0,
+                    fenced: false,
+                },
+            });
+        }
         (runtime, rx)
     }
     pub fn model(&self) -> LockResult<RwLockReadGuard<'_, M>> {
         self.model.read()
     }
     pub fn dispatch(&self, action: RuntimeAction<E, M>) {
+        let _transition = self.transition.lock().expect("transition lock failed");
+        let planned = self.plan_action(action);
+        self.handle_effects(planned);
+    }
+    fn plan_action(&self, action: RuntimeAction<E, M>) -> PlannedEffects<M::Field> {
         let invalidates_addon_results =
             action.field.is_none() && is_local_addon_mutation(&action.action);
-        let (effects, fields) = {
-            let mut model = self.model.write().expect("model write failed");
-            let (effects, fields) = match action {
-                RuntimeAction {
-                    field: Some(field),
-                    action,
-                } => model.update_field(&Msg::Action(action), &field),
-                RuntimeAction { action, .. } => model.update(&Msg::Action(action)),
-            };
-            if invalidates_addon_results {
-                self.addon_epoch.fetch_add(1, Ordering::SeqCst);
-            }
-            (effects, fields)
+        let mut model = self.model.write().expect("model write failed");
+        let (effects, fields) = match action {
+            RuntimeAction {
+                field: Some(field),
+                action,
+            } => model.update_field(&Msg::Action(action), &field),
+            RuntimeAction { action, .. } => model.update(&Msg::Action(action)),
         };
-        self.handle_effects(effects, fields);
+        if invalidates_addon_results {
+            self.addon_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        let addon_context = AddonEffectContext {
+            epoch: self.addon_epoch.load(Ordering::SeqCst),
+            fenced: false,
+        };
+        PlannedEffects {
+            effects,
+            fields,
+            addon_context,
+        }
     }
     #[cfg(test)]
     pub async fn close(&mut self) -> Result<(), anyhow::Error> {
@@ -85,59 +119,114 @@ where
     fn emit(&self, event: RuntimeEvent<E, M>) {
         self.tx.clone().try_send(event).expect("emit event failed");
     }
-    fn handle_effects(&self, effects: Vec<Effect>, fields: Vec<M::Field>) {
+    fn handle_effects(&self, planned: PlannedEffects<M::Field>) {
+        let PlannedEffects {
+            effects,
+            fields,
+            addon_context,
+        } = planned;
+        if addon_context.fenced && addon_context.epoch != self.addon_epoch.load(Ordering::SeqCst) {
+            return;
+        }
         if !fields.is_empty() {
-            #[cfg(test)]
-            let model = self.model.read().expect("model read failed");
-            self.emit(RuntimeEvent::<E, M>::NewState(
-                fields,
+            if addon_context.fenced {
+                let model = self.model.read().expect("model read failed");
+                if addon_context.epoch != self.addon_epoch.load(Ordering::SeqCst) {
+                    return;
+                }
                 #[cfg(test)]
-                model.to_owned(),
-            ));
+                let snapshot = model.to_owned();
+                self.emit(RuntimeEvent::<E, M>::NewState(
+                    fields,
+                    #[cfg(test)]
+                    snapshot,
+                ));
+                drop(model);
+            } else {
+                #[cfg(test)]
+                let model = self.model.read().expect("model read failed");
+                self.emit(RuntimeEvent::<E, M>::NewState(
+                    fields,
+                    #[cfg(test)]
+                    model.to_owned(),
+                ));
+            }
         };
         effects
             .into_iter()
             .for_each(enclose!((self.clone() => runtime) move |effect| {
                 match effect {
                     Effect::Msg(msg) => {
-                        runtime.handle_effect_output(*msg, None);
+                        runtime.handle_effect_output(*msg, addon_context);
                     }
                     Effect::Future(EffectFuture::Sequential(future)) => {
-                        let addon_epoch = runtime.addon_epoch.load(Ordering::SeqCst);
                         E::exec_sequential(future.then(enclose!((runtime) move |msg| async move {
-                            runtime.handle_effect_output(msg, Some(addon_epoch));
+                            runtime.handle_scheduled_effect_output(msg, addon_context);
                         })))
                     },
                     Effect::Future(EffectFuture::Concurrent(future)) => {
-                        let addon_epoch = runtime.addon_epoch.load(Ordering::SeqCst);
                         E::exec_concurrent(future.then(enclose!((runtime) move |msg| async move {
-                            runtime.handle_effect_output(msg, Some(addon_epoch));
+                            runtime.handle_scheduled_effect_output(msg, addon_context);
                         })))
                     }
                 }
             }));
     }
-    fn handle_effect_output(&self, msg: Msg, effect_addon_epoch: Option<u64>) {
+    fn handle_scheduled_effect_output(&self, msg: Msg, addon_context: AddonEffectContext) {
+        let _transition = self.transition.lock().expect("transition lock failed");
+        self.handle_effect_output(msg, addon_context);
+    }
+    fn handle_effect_output(&self, msg: Msg, addon_context: AddonEffectContext) {
         match msg {
             Msg::Event(event) => {
-                self.emit(RuntimeEvent::CoreEvent(event));
+                if addon_context.fenced {
+                    let model = self.model.read().expect("model read failed");
+                    if addon_context.epoch != self.addon_epoch.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    self.emit(RuntimeEvent::CoreEvent(event));
+                    drop(model);
+                } else {
+                    self.emit(RuntimeEvent::CoreEvent(event));
+                }
             }
             Msg::Internal(_) => {
-                let mut model = self.model.write().expect("model write failed");
-                if effect_addon_epoch.is_some_and(|effect_addon_epoch| {
-                    is_addon_result(&msg)
-                        && effect_addon_epoch != self.addon_epoch.load(Ordering::SeqCst)
-                }) {
-                    return;
+                if let Some(planned) = self.plan_internal(&msg, addon_context) {
+                    self.handle_effects(planned);
                 }
-                let (effects, fields) = model.update(&msg);
-                drop(model);
-                self.handle_effects(effects, fields);
             }
             Msg::Action(_) => {
                 panic!("effects are not allowed to resolve with action");
             }
         }
+    }
+    fn plan_internal(
+        &self,
+        msg: &Msg,
+        addon_context: AddonEffectContext,
+    ) -> Option<PlannedEffects<M::Field>> {
+        let addon_context = AddonEffectContext {
+            fenced: addon_context.fenced || is_addon_result(msg),
+            ..addon_context
+        };
+        let mut model = self.model.write().expect("model write failed");
+        if addon_context.fenced && addon_context.epoch != self.addon_epoch.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (effects, fields) = model.update(msg);
+        let addon_context = if addon_context.fenced {
+            addon_context
+        } else {
+            AddonEffectContext {
+                epoch: self.addon_epoch.load(Ordering::SeqCst),
+                fenced: false,
+            }
+        };
+        Some(PlannedEffects {
+            effects,
+            fields,
+            addon_context,
+        })
     }
 }
 
@@ -158,7 +247,8 @@ fn is_addon_result(msg: &Msg) -> bool {
     matches!(
         msg,
         Msg::Internal(
-            Internal::AddonsAPIResult(_, _)
+            Internal::CtxAuthResult(_, _)
+                | Internal::AddonsAPIResult(_, _)
                 | Internal::ResourceRequestResult(_, _)
                 | Internal::ManifestRequestResult(_, _)
                 | Internal::NotificationsRequestResult(_, _)
@@ -169,14 +259,30 @@ fn is_addon_result(msg: &Msg) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ctx::{CtxError, OtherError};
     use crate::types::addon::{ResourcePath, ResourceRequest, ResourceResponse};
+    use crate::types::api::AuthRequest;
     use crate::unit_tests::TestEnv;
+    use futures::StreamExt;
     use serde::{Deserialize, Serialize};
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
     use url::Url;
+
+    #[derive(Clone)]
+    struct ProjectionPause {
+        entered: Arc<Barrier>,
+        resume: Arc<Barrier>,
+    }
 
     #[derive(Clone, Default)]
     struct EpochModel {
+        accepted_auth_results: usize,
+        accepted_descendants: usize,
         accepted_resource_results: usize,
+        projected_addons: Vec<Url>,
+        projection_pause: Option<ProjectionPause>,
+        projection_persistences: usize,
         projection_changes: bool,
     }
 
@@ -190,14 +296,61 @@ mod tests {
 
         fn update(&mut self, msg: &Msg) -> (Vec<Effect>, Vec<Self::Field>) {
             match msg {
-                Msg::Action(Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(_)))
-                    if self.projection_changes =>
-                {
+                Msg::Action(Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(addons))) => {
+                    let changed = self.projection_changes;
                     self.projection_changes = false;
-                    (vec![], vec![EpochField::Ctx])
+                    if changed {
+                        self.projected_addons = addons
+                            .iter()
+                            .map(|addon| addon.transport_url.clone())
+                            .collect();
+                    }
+                    if let Some(pause) = self.projection_pause.take() {
+                        pause.entered.wait();
+                        pause.resume.wait();
+                    }
+                    let transport_urls = if changed {
+                        self.projected_addons.clone()
+                    } else {
+                        vec![]
+                    };
+                    let mut effects = vec![Effect::Msg(Box::new(Msg::Event(
+                        Event::AddonProjectionReplacedLocal { transport_urls },
+                    )))];
+                    if changed {
+                        effects.push(Effect::Msg(Box::new(Msg::Internal(
+                            Internal::ProfileChanged,
+                        ))));
+                    }
+                    let fields = if changed {
+                        vec![EpochField::Ctx]
+                    } else {
+                        vec![]
+                    };
+                    (effects, fields)
+                }
+                Msg::Action(Action::Unload) => {
+                    (vec![Effect::Msg(Box::new(resource_result()))], vec![])
                 }
                 Msg::Internal(Internal::ResourceRequestResult(_, _)) => {
                     self.accepted_resource_results += 1;
+                    (
+                        vec![Effect::Msg(Box::new(Msg::Internal(
+                            Internal::PullNotifications,
+                        )))],
+                        vec![EpochField::Ctx],
+                    )
+                }
+                Msg::Internal(Internal::CtxAuthResult(_, _)) => {
+                    self.accepted_auth_results += 1;
+                    (vec![], vec![EpochField::Ctx])
+                }
+                Msg::Internal(Internal::ProfileChanged) => {
+                    self.projection_persistences += 1;
+                    (vec![], vec![])
+                }
+                Msg::Internal(Internal::PullNotifications) => {
+                    self.accepted_descendants += 1;
                     (vec![], vec![])
                 }
                 _ => (vec![], vec![]),
@@ -220,6 +373,15 @@ mod tests {
                 ResourcePath::without_extra("stream", "series", "tt1:1:1"),
             ),
             Box::new(Ok(ResourceResponse::Streams { streams: vec![] })),
+        ))
+    }
+
+    fn auth_result() -> Msg {
+        Msg::Internal(Internal::CtxAuthResult(
+            AuthRequest::LoginWithToken {
+                token: "old-owner-token".to_owned(),
+            },
+            Err(CtxError::Other(OtherError::UserNotLoggedIn)),
         ))
     }
 
@@ -259,7 +421,13 @@ mod tests {
             field: None,
             action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![])),
         });
-        runtime.handle_effect_output(resource_result(), Some(old_epoch));
+        runtime.handle_effect_output(
+            resource_result(),
+            AddonEffectContext {
+                epoch: old_epoch,
+                fenced: false,
+            },
+        );
 
         assert_eq!(
             runtime.model().unwrap().accepted_resource_results,
@@ -277,8 +445,211 @@ mod tests {
             field: None,
             action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![])),
         });
-        runtime.handle_effect_output(resource_result(), Some(epoch));
+        runtime.handle_effect_output(
+            resource_result(),
+            AddonEffectContext {
+                epoch,
+                fenced: false,
+            },
+        );
 
         assert_eq!(runtime.model().unwrap().accepted_resource_results, 0);
+    }
+
+    #[test]
+    fn local_projection_rejects_in_flight_auth_result_before_model_update() {
+        let (runtime, _rx) = Runtime::<TestEnv, _>::new(EpochModel::default(), vec![], 8);
+        let epoch = runtime.addon_epoch.load(Ordering::SeqCst);
+
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![])),
+        });
+        runtime.handle_effect_output(
+            auth_result(),
+            AddonEffectContext {
+                epoch,
+                fenced: false,
+            },
+        );
+
+        assert_eq!(
+            runtime.model().unwrap().accepted_auth_results,
+            0,
+            "an auth result carrying the old add-on collection must not replace the new owner"
+        );
+    }
+
+    #[test]
+    fn addon_result_plan_keeps_pre_projection_epoch_when_effect_handling_is_delayed() {
+        let (runtime, _rx) = Runtime::<TestEnv, _>::new(EpochModel::default(), vec![], 8);
+        let planned = runtime.plan_action(RuntimeAction {
+            field: None,
+            action: Action::Unload,
+        });
+
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![])),
+        });
+        runtime.handle_effects(planned);
+
+        assert_eq!(
+            runtime.model().unwrap().accepted_resource_results,
+            0,
+            "an add-on result planned before the owner boundary must not inherit the new epoch"
+        );
+    }
+
+    #[test]
+    fn addon_result_descendants_keep_origin_epoch_when_effect_handling_is_delayed() {
+        let (runtime, mut rx) = Runtime::<TestEnv, _>::new(EpochModel::default(), vec![], 8);
+        let epoch = runtime.addon_epoch.load(Ordering::SeqCst);
+        let planned = runtime
+            .plan_internal(
+                &resource_result(),
+                AddonEffectContext {
+                    epoch,
+                    fenced: false,
+                },
+            )
+            .expect("the result is current before the forced owner transition");
+
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![])),
+        });
+        runtime.handle_effects(planned);
+
+        let model = runtime.model().unwrap();
+        assert_eq!(model.accepted_resource_results, 1);
+        assert_eq!(
+            model.accepted_descendants, 0,
+            "a descendant of the old result must not be rebound to the new epoch"
+        );
+        drop(model);
+        let mut emitted_stale_state = false;
+        while let Some(Some(event)) = rx.next().now_or_never() {
+            emitted_stale_state |= matches!(event, RuntimeEvent::NewState(_, _));
+        }
+        assert!(
+            !emitted_stale_state,
+            "the stale result must not emit NewState after the owner transition"
+        );
+    }
+
+    #[test]
+    fn current_addon_result_preserves_state_and_descendant_effects() {
+        let (runtime, mut rx) = Runtime::<TestEnv, _>::new(EpochModel::default(), vec![], 8);
+        let epoch = runtime.addon_epoch.load(Ordering::SeqCst);
+
+        runtime.handle_effect_output(
+            resource_result(),
+            AddonEffectContext {
+                epoch,
+                fenced: false,
+            },
+        );
+
+        let model = runtime.model().unwrap();
+        assert_eq!(model.accepted_resource_results, 1);
+        assert_eq!(model.accepted_descendants, 1);
+        drop(model);
+        assert!(matches!(
+            rx.next().now_or_never(),
+            Some(Some(RuntimeEvent::NewState(
+                fields,
+                EpochModel {
+                    accepted_auth_results: 0,
+                    accepted_descendants: 0,
+                    accepted_resource_results: 1,
+                    ..
+                }
+            ))) if fields == vec![EpochField::Ctx]
+        ));
+    }
+
+    #[test]
+    fn committed_projection_drains_before_a_following_noop_projection() {
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let target = crate::constants::OFFICIAL_ADDONS[0].clone();
+        let (runtime, mut rx) = Runtime::<TestEnv, _>::new(
+            EpochModel {
+                projected_addons: vec![
+                    Url::parse("https://old-owner.example/manifest.json").unwrap()
+                ],
+                projection_pause: Some(ProjectionPause {
+                    entered: entered.clone(),
+                    resume: resume.clone(),
+                }),
+                projection_changes: true,
+                ..Default::default()
+            },
+            vec![],
+            8,
+        );
+        let runtime = Arc::new(runtime);
+
+        let first_runtime = runtime.clone();
+        let first_target = target.clone();
+        let first = thread::spawn(move || {
+            first_runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![first_target])),
+            });
+        });
+        entered.wait();
+
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_runtime = runtime.clone();
+        let second = thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            second_runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![target])),
+            });
+            second_done_tx.send(()).unwrap();
+        });
+        second_started_rx.recv().unwrap();
+        assert!(matches!(
+            second_done_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        resume.wait();
+        first.join().unwrap();
+        second.join().unwrap();
+        second_done_rx.recv().unwrap();
+
+        let model = runtime.model().unwrap();
+        assert_eq!(
+            model.projected_addons,
+            vec![crate::constants::OFFICIAL_ADDONS[0].transport_url.clone()]
+        );
+        assert_eq!(
+            model.projection_persistences, 1,
+            "the changed projection must persist exactly once"
+        );
+        drop(model);
+
+        let mut new_states = 0;
+        let mut receipt_sizes = vec![];
+        while let Some(Some(event)) = rx.next().now_or_never() {
+            match event {
+                RuntimeEvent::NewState(_, _) => new_states += 1,
+                RuntimeEvent::CoreEvent(Event::AddonProjectionReplacedLocal { transport_urls }) => {
+                    receipt_sizes.push(transport_urls.len())
+                }
+                RuntimeEvent::CoreEvent(_) => {}
+            }
+        }
+        assert_eq!(new_states, 1);
+        assert_eq!(
+            receipt_sizes,
+            vec![1, 0],
+            "the changed receipt must precede the following no-op receipt"
+        );
     }
 }
