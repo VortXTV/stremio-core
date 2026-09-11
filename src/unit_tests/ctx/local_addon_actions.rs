@@ -497,6 +497,27 @@ fn actionctx_remote_mutations_remain_blocked_while_addons_are_locked() {
 }
 
 #[test]
+fn actionctx_local_install_rejects_configuration_required_without_remote_write() {
+    let mut addon = addon("https://required.example/manifest.json", 1);
+    addon.manifest.behavior_hints.configuration_required = true;
+
+    let _env_mutex = TestEnv::reset().unwrap();
+    let (runtime, _rx) = new_runtime(authenticated_profile(vec![]), StreamsBucket::default());
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Ctx(ActionCtx::InstallAddonLocal(addon)),
+        });
+    });
+
+    let profile = &runtime.model().unwrap().ctx.profile;
+    assert_eq!(profile.auth_key(), Some(&AuthKey("auth_key".to_owned())));
+    assert!(profile.addons.is_empty());
+    assert!(REQUESTS.read().unwrap().is_empty());
+    assert!(STORAGE.read().unwrap().get(PROFILE_STORAGE_KEY).is_none());
+}
+
+#[test]
 fn actionctx_local_addon_projection_replaces_unprotected_addons_without_remote_write() {
     let mut protected = addon("https://protected.example/manifest.json", 1);
     protected.flags.protected = true;
