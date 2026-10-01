@@ -106,6 +106,11 @@ impl LibraryItem {
             self.state.last_watched = Some(E::now());
         } else {
             self.state.times_watched = 0;
+            if self.r#type == "movie" {
+                // Preserve an explicit whole-movie clear even when a restored item has never
+                // been viewed. This is history mutation evidence, not a fabricated viewing time.
+                self.state.watched = Some(WatchedBitField::construct_from_array(vec![], vec![]).into());
+            }
         }
     }
 
@@ -249,7 +254,8 @@ pub struct LibraryItemState {
     #[serde_as(deserialize_as = "DefaultOnNull<NoneAsEmptyString>")]
     pub video_id: Option<String>,
     /// Field tracking watched videos.
-    /// For [`LibraryItem`]s without videos, this field should [`None`].
+    /// For [`LibraryItem`]s without videos, this field is normally [`None`]. An explicit whole-movie
+    /// unwatch retains the canonical empty field so that the clear survives persistence and sync.
     #[serde(default)]
     #[serde_as(deserialize_as = "DefaultOnNull<NoneAsEmptyString>")]
     pub watched: Option<WatchedField>,

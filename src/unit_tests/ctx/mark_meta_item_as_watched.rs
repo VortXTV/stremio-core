@@ -199,3 +199,54 @@ fn meta_item_unwatch_existing_item_resets() {
         .expect("Item still exists");
     assert_eq!(item.state.times_watched, 0, "times_watched reset to 0");
 }
+
+#[test]
+fn explicit_movie_unwatch_retains_empty_history_without_fabricating_viewing_time() {
+    let _env_mutex = TestEnv::reset().expect("exclusive test environment");
+    let old = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+    let now = Utc.with_ymd_and_hms(2020, 1, 2, 0, 0, 0).unwrap();
+    *NOW.write().unwrap() = now;
+    let existing = LibraryItem {
+        id: "tt123".into(), removed: false, temp: false,
+        ctime: Some(old), mtime: old,
+        state: LibraryItemState {
+            times_watched: 1, flagged_watched: 1, last_watched: None,
+            ..Default::default()
+        },
+        name: "Test Movie".to_owned(), r#type: "movie".to_owned(),
+        poster: None, poster_shape: Default::default(), behavior_hints: Default::default(),
+    };
+    let (runtime, _rx) = test_runtime(LibraryBucket::new(None, vec![existing]));
+    TestEnv::run(|| runtime.dispatch(RuntimeAction {
+        field: None,
+        action: Action::Ctx(ActionCtx::MetaItemMarkAsWatched {
+            meta_item: meta_preview(), is_watched: false,
+        }),
+    }));
+    let model = runtime.model().unwrap();
+    let item = &model.ctx.library.items["tt123"];
+    assert!(!item.watched());
+    assert!(item.state.last_watched.is_none());
+    assert_eq!(item.state.flagged_watched, 1, "per-video flag semantics are independent");
+    assert_eq!(item.mtime, now);
+    assert_eq!(item.state.watched.as_ref().unwrap().to_string(), "undefined:1:eJwDAAAAAAE=");
+    let stored: LibraryBucket = serde_json::from_str(STORAGE.read().unwrap().get(LIBRARY_RECENT_STORAGE_KEY).unwrap()).unwrap();
+    assert_eq!(stored.items["tt123"], *item);
+}
+
+#[test]
+fn cold_movie_membership_does_not_create_explicit_unwatch_evidence() {
+    let _env_mutex = TestEnv::reset().expect("exclusive test environment");
+    assert!(LibraryItemState::default().watched.is_none());
+    let (runtime, _rx) = test_runtime(LibraryBucket::default());
+    TestEnv::run(|| runtime.dispatch(RuntimeAction {
+        field: None,
+        action: Action::Ctx(ActionCtx::AddToLibrary(meta_preview())),
+    }));
+    let model = runtime.model().unwrap();
+    let item = &model.ctx.library.items["tt123"];
+    assert!(!item.watched());
+    assert!(item.state.watched.is_none());
+    let stored: LibraryBucket = serde_json::from_str(STORAGE.read().unwrap().get(LIBRARY_RECENT_STORAGE_KEY).unwrap()).unwrap();
+    assert!(stored.items["tt123"].state.watched.is_none());
+}
