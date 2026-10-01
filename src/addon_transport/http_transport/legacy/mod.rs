@@ -1,3 +1,4 @@
+use crate::addon_transport::http_transport::addon_request;
 use crate::addon_transport::AddonTransport;
 use crate::constants::{
     BASE64, VIDEO_FILENAME_EXTRA_PROP, VIDEO_HASH_EXTRA_PROP, VIDEO_SIZE_EXTRA_PROP,
@@ -143,7 +144,7 @@ impl<T: Env> AddonTransport for AddonLegacyTransport<'_, T> {
     }
     fn manifest(&self) -> TryEnvFuture<Manifest> {
         let url = format!("{}/q.json?b={}", self.transport_url, MANIFEST_REQUEST_PARAM);
-        let r = Request::get(url).body(()).expect("request builder failed");
+        let r = addon_request(Request::get(url).body(()).expect("request builder failed"));
         T::fetch::<_, JsonRPCResp<LegacyManifestResp>>(r)
             .and_then(map_response)
             .map_ok(Into::into)
@@ -241,7 +242,9 @@ fn build_legacy_req(transport_url: &Url, path: &ResourcePath) -> Result<Request<
         serde_json::to_string(&q_json).map_err(|error| EnvError::Serde(error.to_string()))?,
     );
     let url = format!("{transport_url}/q.json?b={param_str}");
-    Ok(Request::get(url).body(()).expect("request builder failed"))
+    Ok(addon_request(
+        Request::get(url).body(()).expect("request builder failed"),
+    ))
 }
 
 fn build_jsonrpc(method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -301,10 +304,15 @@ mod test {
         let transport_url = Url::parse("https://stremio-mixer.schneider.ax/stremioget/stremio/v1")
             .expect("url parse failed");
         let path = ResourcePath::without_extra("catalog", "tv", "popularities.mixer");
+        let request = build_legacy_req(&transport_url, &path).unwrap();
         assert_eq!(
-            &build_legacy_req(&transport_url, &path).unwrap().uri().to_string(),
+            &request.uri().to_string(),
             "https://stremio-mixer.schneider.ax/stremioget/stremio/v1/q.json?b=eyJpZCI6MSwianNvbnJwYyI6IjIuMCIsIm1ldGhvZCI6Im1ldGEuZmluZCIsInBhcmFtcyI6W251bGwseyJsaW1pdCI6MTAwLCJxdWVyeSI6eyJ0eXBlIjoidHYifSwic2tpcCI6MCwic29ydCI6eyJwb3B1bGFyaXRpZXMubWl4ZXIiOi0xLCJwb3B1bGFyaXR5IjotMX19XX0=",
         );
+        assert!(request
+            .extensions()
+            .get::<super::super::AddonHTTPTransportRequest>()
+            .is_some());
     }
 
     #[test]

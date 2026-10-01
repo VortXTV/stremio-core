@@ -71,8 +71,12 @@ pub enum Internal {
     InstallTraktAddon,
     /// Dispatched when addons needs to be installed.
     InstallAddon(Descriptor),
+    /// Dispatched when addons needs to be installed without an authenticated collection write.
+    InstallAddonLocal(Descriptor),
     /// Dispatched when addons needs to be uninstalled.
     UninstallAddon(Descriptor),
+    /// Dispatched when addons needs to be uninstalled without an authenticated collection write.
+    UninstallAddonLocal(Descriptor),
     UninstallTraktAddon,
     /// Dispatched when a new stream is loaded into the Player.
     StreamLoaded {

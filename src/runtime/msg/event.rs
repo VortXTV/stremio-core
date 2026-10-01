@@ -64,6 +64,11 @@ pub enum Event {
     AddonsPulledFromAPI {
         transport_urls: Vec<Url>,
     },
+    /// Receipt for an atomic local add-on projection. This is distinct from a remote collection
+    /// pull so native hosts can prove which operation completed.
+    AddonProjectionReplacedLocal {
+        transport_urls: Vec<Url>,
+    },
     AddonsPushedToAPI {
         transport_urls: Vec<Url>,
     },
@@ -159,4 +164,27 @@ pub enum Event {
         error: CtxError,
         source: Box<Event>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn local_projection_receipt_has_a_distinct_stable_transport_shape() {
+        let event = Event::AddonProjectionReplacedLocal {
+            transport_urls: vec![Url::parse("https://addon.example/manifest.json").unwrap()],
+        };
+
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "event": "AddonProjectionReplacedLocal",
+                "args": {
+                    "transport_urls": ["https://addon.example/manifest.json"]
+                }
+            })
+        );
+    }
 }

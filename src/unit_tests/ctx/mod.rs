@@ -2,6 +2,7 @@ mod add_to_library;
 mod authenticate;
 mod delete_account;
 mod install_addon;
+mod local_addon_actions;
 mod logout;
 mod mark_meta_item_as_watched;
 mod update_events;
