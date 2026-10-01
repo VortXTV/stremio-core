@@ -67,6 +67,29 @@ where
         };
         self.handle_effects(effects, fields);
     }
+
+    /// Run one host-owned model transaction and publish the returned state changes.
+    ///
+    /// This is deliberately lower-level than [`Self::dispatch`]: platform bridges sometimes need
+    /// to restore already-authenticated persisted state whose authoritative timestamp must not be
+    /// replaced by a local `Env::now()` action. The caller performs all validation and persistence
+    /// while the model write lock is held, then returns the exact effects and model fields that
+    /// should be published. Effects and `RuntimeEvent::NewState` are handled only after the lock is
+    /// released, matching `dispatch`'s ordering.
+    ///
+    /// A caller can return any result type (including `Result`) and an empty effects/fields pair to
+    /// fail closed without publishing a state change.
+    pub fn transact<R>(
+        &self,
+        transaction: impl FnOnce(&mut M) -> (R, Vec<Effect>, Vec<M::Field>),
+    ) -> R {
+        let (result, effects, fields) = {
+            let mut model = self.model.write().expect("model write failed");
+            transaction(&mut model)
+        };
+        self.handle_effects(effects, fields);
+        result
+    }
     #[cfg(test)]
     pub async fn close(&mut self) -> Result<(), anyhow::Error> {
         self.tx.flush().await?;
