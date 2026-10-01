@@ -53,6 +53,11 @@ impl WatchedField {
     /// Deserialization stays permissive for compatibility with historical server data. New restore
     /// writes, however, must reject anchors that cannot map safely onto the decoded bit buffer.
     pub fn validate_episode_anchor(&self) -> Result<(), Error> {
+        // This is the canonical wire value produced by an empty `WatchedBitField`. It has no
+        // catalogue mapping to validate, but is distinct from an untyped non-empty anchor.
+        if self.anchor_video == "undefined" && self.anchor_length == 1 && self.bitfield.length == 0 {
+            return Ok(());
+        }
         if self.anchor_length == 0 || self.anchor_length > self.bitfield.length {
             return Err(Error("Watched anchor length is outside the decoded bitfield".to_owned()));
         }

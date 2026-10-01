@@ -1,6 +1,7 @@
 use crate::types::library::LibraryItemState;
 use chrono::{TimeZone, Utc};
 use serde_test::{assert_de_tokens, assert_tokens, Token};
+use stremio_watched_bitfield::WatchedBitField;
 
 #[test]
 fn library_item_state() {
@@ -185,6 +186,11 @@ fn restored_watched_field_preserves_the_exact_serialized_bitfield() {
         raw,
         "the restore bridge must not rebuild episode bits from an incomplete id list"
     );
+    let catalog_ids = (1..=6).map(|episode| format!("tt2934286:1:{episode}")).collect();
+    let mapped = WatchedBitField::construct_with_videos(state.watched.clone().unwrap(), catalog_ids)
+        .expect("valid fixture should map against the complete catalogue");
+    assert!(mapped.get_video("tt2934286:1:5"));
+    assert!(!mapped.get_video("tt2934286:1:6"));
     assert!(state.set_watched_serialized(Some("not-a-watched-field")).is_err());
     assert!(state
         .set_watched_serialized(Some("tt2934286:1:5:0:eJyTZwAAAEAAIA=="))
@@ -203,5 +209,20 @@ fn restored_watched_field_preserves_the_exact_serialized_bitfield() {
             .expect("state should still serialize")["watched"],
         raw,
         "a rejected restore field must not replace the last valid persisted field"
+    );
+}
+
+#[test]
+fn restored_canonical_empty_watched_field_round_trips() {
+    let raw = "undefined:1:eJwDAAAAAAE=";
+    let mut state = LibraryItemState::default();
+
+    state
+        .set_watched_serialized(Some(raw))
+        .expect("canonical empty watched wire value should remain compatible");
+
+    assert_eq!(
+        serde_json::to_value(&state).expect("state should serialize")["watched"],
+        raw
     );
 }
