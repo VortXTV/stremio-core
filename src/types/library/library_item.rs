@@ -261,6 +261,19 @@ pub struct LibraryItemState {
 }
 
 impl LibraryItemState {
+    /// Replace the serialized episode-watch field without needing a catalogue's full video list.
+    ///
+    /// `WatchedField` deliberately carries an anchor and encoded bitfield rather than a lossy list
+    /// of watched IDs. Host restore bridges must preserve that exact value: reconstructing it from
+    /// only the watched IDs changes the bit positions once the complete catalogue is loaded.
+    pub fn set_watched_serialized(&mut self, watched: Option<&str>) -> Result<(), String> {
+        self.watched = watched
+            .map(str::parse::<WatchedField>)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn watched_bitfield(&self, videos: &[Video]) -> WatchedBitField {
         let video_ids = videos
             .iter()

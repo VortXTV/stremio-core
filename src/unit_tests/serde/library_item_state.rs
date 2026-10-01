@@ -169,3 +169,21 @@ fn library_item_state() {
         ],
     );
 }
+
+#[test]
+fn restored_watched_field_preserves_the_exact_serialized_bitfield() {
+    let raw = "tt2934286:1:5:5:eJyTZwAAAEAAIA==";
+    let mut state = LibraryItemState::default();
+
+    state
+        .set_watched_serialized(Some(raw))
+        .expect("known persisted watched bitfield should restore");
+
+    assert_eq!(
+        serde_json::to_value(&state)
+            .expect("state should serialize")["watched"],
+        raw,
+        "the restore bridge must not rebuild episode bits from an incomplete id list"
+    );
+    assert!(state.set_watched_serialized(Some("not-a-watched-field")).is_err());
+}
