@@ -267,10 +267,16 @@ impl LibraryItemState {
     /// of watched IDs. Host restore bridges must preserve that exact value: reconstructing it from
     /// only the watched IDs changes the bit positions once the complete catalogue is loaded.
     pub fn set_watched_serialized(&mut self, watched: Option<&str>) -> Result<(), String> {
-        self.watched = watched
+        let watched = watched
             .map(str::parse::<WatchedField>)
             .transpose()
             .map_err(|error| error.to_string())?;
+        if let Some(watched) = watched.as_ref() {
+            watched
+                .validate_episode_anchor()
+                .map_err(|error| error.to_string())?;
+        }
+        self.watched = watched;
         Ok(())
     }
 

@@ -47,6 +47,28 @@ impl Display for WatchedField {
     }
 }
 
+impl WatchedField {
+    /// Validate the anchor carried by a host-supplied restore payload.
+    ///
+    /// Deserialization stays permissive for compatibility with historical server data. New restore
+    /// writes, however, must reject anchors that cannot map safely onto the decoded bit buffer.
+    pub fn validate_episode_anchor(&self) -> Result<(), Error> {
+        if self.anchor_length == 0 || self.anchor_length > self.bitfield.length {
+            return Err(Error("Watched anchor length is outside the decoded bitfield".to_owned()));
+        }
+
+        let mut parts = self.anchor_video.rsplitn(3, ':');
+        let episode = parts.next().unwrap_or_default();
+        let season = parts.next().unwrap_or_default();
+        let meta_id = parts.next().unwrap_or_default();
+        if meta_id.is_empty() || season.parse::<u32>().is_err() || episode.parse::<u32>().is_err()
+        {
+            return Err(Error("Watched anchor must be a typed episode video id".to_owned()));
+        }
+        Ok(())
+    }
+}
+
 impl From<WatchedBitField> for WatchedField {
     fn from(watched_bit_field: WatchedBitField) -> Self {
         let last_id = watched_bit_field.bitfield.last_index_of(true).unwrap_or(0);

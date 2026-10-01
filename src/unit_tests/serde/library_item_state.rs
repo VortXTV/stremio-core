@@ -186,4 +186,22 @@ fn restored_watched_field_preserves_the_exact_serialized_bitfield() {
         "the restore bridge must not rebuild episode bits from an incomplete id list"
     );
     assert!(state.set_watched_serialized(Some("not-a-watched-field")).is_err());
+    assert!(state
+        .set_watched_serialized(Some("tt2934286:1:5:0:eJyTZwAAAEAAIA=="))
+        .is_err());
+    assert!(state
+        .set_watched_serialized(Some("tt2934286:1:5:2147483648:eJyTZwAAAEAAIA=="))
+        .is_err());
+    assert!(state
+        .set_watched_serialized(Some("tt2934286:1:5:17:eJyTZwAAAEAAIA=="))
+        .is_err());
+    assert!(state
+        .set_watched_serialized(Some("not-an-episode:5:eJyTZwAAAEAAIA=="))
+        .is_err());
+    assert_eq!(
+        serde_json::to_value(&state)
+            .expect("state should still serialize")["watched"],
+        raw,
+        "a rejected restore field must not replace the last valid persisted field"
+    );
 }
