@@ -145,3 +145,79 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::{FutureExt, StreamExt};
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::{
+        runtime::{msg::Internal, Effects, Model},
+        unit_tests::TestEnv,
+    };
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TransactionModel {
+        value: u8,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    enum TransactionField {
+        Value,
+    }
+
+    impl Model<TestEnv> for TransactionModel {
+        type Field = TransactionField;
+
+        fn update(&mut self, msg: &Msg) -> (Vec<Effect>, Vec<Self::Field>) {
+            if matches!(msg, Msg::Internal(Internal::LibraryChanged(true))) {
+                // This write proves `transact` released its model lock before handling effects.
+                self.value += 1;
+                (vec![], vec![TransactionField::Value])
+            } else {
+                (vec![], vec![])
+            }
+        }
+
+        fn update_field(&mut self, msg: &Msg, _field: &Self::Field) -> (Vec<Effect>, Vec<Self::Field>) {
+            self.update(msg)
+        }
+    }
+
+    #[test]
+    fn transact_publishes_success_and_handles_internal_effects_after_unlock() {
+        let _env = TestEnv::reset().expect("test environment lock");
+        let (runtime, mut events) = Runtime::<TestEnv, _>::new(TransactionModel { value: 0 }, vec![], 4);
+
+        let result = runtime.transact(|model| {
+            model.value = 1;
+            (
+                Ok::<_, ()>("persisted"),
+                Effects::msg(Msg::Internal(Internal::LibraryChanged(true)))
+                    .into_iter()
+                    .collect(),
+                vec![TransactionField::Value],
+            )
+        });
+
+        assert_eq!(result, Ok("persisted"));
+        assert_eq!(runtime.model().expect("model read").value, 2);
+        assert!(events.next().now_or_never().is_some(), "transaction publication missing");
+        assert!(events.next().now_or_never().is_some(), "internal effect publication missing");
+    }
+
+    #[test]
+    fn transact_failure_can_leave_memory_and_publication_unchanged() {
+        let _env = TestEnv::reset().expect("test environment lock");
+        let (runtime, mut events) = Runtime::<TestEnv, _>::new(TransactionModel { value: 7 }, vec![], 4);
+
+        let result = runtime.transact(|_model| {
+            (Err::<(), _>("persistence failed"), vec![], vec![])
+        });
+
+        assert_eq!(result, Err("persistence failed"));
+        assert_eq!(runtime.model().expect("model read").value, 7);
+        assert!(events.next().now_or_never().is_none(), "failure must not publish state");
+    }
+}
