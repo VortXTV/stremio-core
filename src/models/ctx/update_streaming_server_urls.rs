@@ -28,6 +28,9 @@ pub fn update_streaming_server_urls<E: Env + 'static>(
             (CtxStatus::Loading(loading_auth_request), Ok(CtxAuthResponse { auth, .. }))
                 if loading_auth_request == auth_request =>
             {
+                if streaming_server_urls.uid.as_ref() == Some(&auth.user.id) {
+                    return Effects::none().unchanged();
+                }
                 let next_server_urls = ServerUrlsBucket::new::<E>(Some(auth.user.id.to_owned()));
                 *streaming_server_urls = next_server_urls;
                 Effects::msg(Msg::Internal(Internal::StreamingServerUrlsBucketChanged))

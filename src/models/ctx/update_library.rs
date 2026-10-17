@@ -204,10 +204,17 @@ pub fn update_library<E: Env + 'static>(
                     ..
                 }),
             ) if loading_auth_request == auth_request => {
-                let next_library = LibraryBucket::new(
-                    Some(auth.user.id.to_owned()),
-                    library_items_result.to_owned().unwrap_or_default(),
-                );
+                let uid = Some(auth.user.id.to_owned());
+                // Reauthentication is not an account switch. A failed or stale
+                // fetch must not erase this account's local edits/tombstones.
+                let mut next_library = if library.uid == uid {
+                    library.clone()
+                } else {
+                    LibraryBucket::new(uid, vec![])
+                };
+                if let Ok(items) = library_items_result {
+                    next_library.merge_items(items.to_owned());
+                }
                 if *library != next_library {
                     *library = next_library;
                     Effects::msg(Msg::Internal(Internal::LibraryChanged(false)))

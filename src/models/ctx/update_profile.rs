@@ -226,11 +226,20 @@ pub fn update_profile<E: Env + 'static>(
                     ..
                 }),
             ) if loading_auth_request == auth_request => {
+                let same_account = profile.uid().as_ref() == Some(&auth.user.id);
                 let next_profile = Profile {
                     auth: Some(auth.to_owned()),
-                    addons: addons_result.to_owned().unwrap_or(OFFICIAL_ADDONS.clone()),
+                    addons: match addons_result {
+                        Ok(addons) => addons.to_owned(),
+                        Err(_) if same_account => profile.addons.clone(),
+                        Err(_) => OFFICIAL_ADDONS.clone(),
+                    },
                     addons_locked: addons_result.is_err(),
-                    settings: Settings::default(),
+                    settings: if same_account {
+                        profile.settings.clone()
+                    } else {
+                        Settings::default()
+                    },
                 };
                 if *profile != next_profile {
                     *profile = next_profile;

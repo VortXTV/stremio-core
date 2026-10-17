@@ -88,6 +88,9 @@ pub fn update_streams<E: Env + 'static>(
             (CtxStatus::Loading(loading_auth_request), Ok(CtxAuthResponse { auth, .. }))
                 if loading_auth_request == auth_request =>
             {
+                if streams.uid.as_ref() == Some(&auth.user.id) {
+                    return Effects::none().unchanged();
+                }
                 let next_streams = StreamsBucket::new(Some(auth.user.id.to_owned()));
                 if *streams != next_streams {
                     *streams = next_streams;
