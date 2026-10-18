@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::models::ctx::CtxError;
 use crate::runtime::msg::{Event, Internal, Msg};
-use crate::runtime::{Effect, Effects, EnvFuture};
+use crate::runtime::{Effect, Effects, EnvFuture, PrefixCompletion};
 use crate::types::library::{LibraryItem, LibraryItemId};
 
 /// Opaque caller provenance. Clone copies one Arc, never a typed model or history.
@@ -293,9 +293,11 @@ impl ScopedEffect {
 }
 
 /// At most two logical Profile/Library completion events, never one per physical member.
-/// The future owns original subjects/provenance. Runtime only delivers its events.
+/// Original storage/attempt capability, never a refreshed root on later resolution.
+/// Pending must be bound to its exact admitted publisher before FIFO returns.
 pub struct LocalPrefix {
-    pub future: EnvFuture<'static, [Option<Event>; 2]>,
+    pub origin: ScopeToken,
+    pub future: EnvFuture<'static, PrefixCompletion>,
 }
 
 pub struct ScopedPlan<F> {

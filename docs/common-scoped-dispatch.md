@@ -37,10 +37,11 @@ separate. Admission errors are additive; existing Other codes 1–8 are unchange
 
 ## Required integration and verification
 
-Completion delivery still needs original storage/auth-attempt and add-on authority
-validated after acquiring the Runtime transition, for both initial and later
-resolved completions. A future-side check before waiting is insufficient. Real
-owner admission/reservation, recorded reducers, eager persistence suppression,
+Recorded completion delivery now asks the Model for an original-authority lease
+after acquiring the Runtime transition, for both initial and later resolved
+completions. The default Model response refuses; a synthetic validator is not real
+storage/auth-attempt authority. A future-side check before waiting is insufficient.
+Real owner admission/reservation, recorded reducers, eager persistence suppression,
 facade routing, uncertain-publication ownership and their composition fixtures
 remain integration requirements. The transport does not provide those by itself.
 
@@ -55,3 +56,33 @@ original production test body was deleted. They are not a full upstream test-tar
 clippy/MSRV, native-application or whole-program compatibility claim. Real Owner,
 completion-delivery and storage integration remain open. No SDK, release,
 live-data or performance acceptance follows from these synthetic checks.
+
+## Recorded completion queue milestone
+
+The explicitly recorded route uses one elastic queue for ordinary and completion
+events. Close and commit use the same queue mutex. A completion's prepared nodes
+and rejected payloads outlive the authority, Model and transition guards. Taken
+wakers and deferred drops run after those guards release, including on unwind.
+An already committed event is not retried if its wake later panics. The Legacy
+constructor retains its existing bounded channel and ordinary dispatch behavior.
+
+A pending completion carries one original, non-cloneable publisher/receiver pair.
+Cancellation or observer loss is not a durable rollback, ACK or replay permit.
+The Runtime holds weak delivery targets so a pending observer does not retain the
+whole Model. Original storage/auth and add-on authority must remain valid at each
+actual queue commit; cancellation stops observation, not an admitted remote write.
+
+The exact placed source passed all 41 named source-unit cases in separately fresh
+default and `env-future-send` compilations: 13 scoped transport, 19 completion
+delivery and nine queue cases, with zero ignored or filtered cases in each run.
+The original old-test suffix remains present; the same 23 unrelated test-module
+entries were excluded only in disposable staging. A test-only Legacy-adapter
+dead-code warning remains visible in these narrowed builds, not suppressed.
+
+This is an unwired source milestone, not native activation. The consuming Env
+handoff can still reject, panic or drop a future while the transition is held;
+recoverable post-guard handoff remains required. Real Owner/borrowed-Ctx issuance,
+Unknown publisher binding, ordinary payload destruction, shutdown/quiescence,
+queue/resource budgeting and whole-program/device performance remain open.
+No full upstream suite, SDK, app build, live-account operation or release result
+is claimed by these 41-case checks.

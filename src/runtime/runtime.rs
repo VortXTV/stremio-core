@@ -1,4 +1,6 @@
 use crate::runtime::msg::{Action, ActionCtx, Event, Internal, Msg};
+use crate::runtime::recorded_output::{self, Prepared, RecordedSender, RecordedTransition};
+use crate::runtime::RecordedReceiver;
 use crate::runtime::{
     admission_error, AdmissionOutcome, DeclineReason, DeclineReceiver, DeclinedMutation,
     DirectKind, DirectOutcome, Effect, EffectFuture, EffectScope, Env, LibraryContinuation,
@@ -39,13 +41,39 @@ struct PlannedEffects<F> {
     addon_context: AddonEffectContext,
 }
 
+#[path = "completion_delivery.rs"]
+mod completion_delivery;
+use completion_delivery::CompletionLifetime;
+
+enum OutputTx<T> {
+    Legacy(Sender<T>),
+    Recorded(RecordedSender<T>),
+}
+impl<T> Clone for OutputTx<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Legacy(tx) => Self::Legacy(tx.clone()),
+            Self::Recorded(tx) => Self::Recorded(tx.clone()),
+        }
+    }
+}
+impl<T> OutputTx<T> {
+    fn recorded(&self) -> Option<&RecordedSender<T>> {
+        match self {
+            Self::Recorded(tx) => Some(tx),
+            Self::Legacy(_) => None,
+        }
+    }
+}
+
 #[derive(Derivative)]
 #[derivative(Clone(bound = ""))]
 pub struct Runtime<E: Env, M: Model<E>> {
     model: Arc<RwLock<M>>,
-    tx: Sender<RuntimeEvent<E, M>>,
+    tx: OutputTx<RuntimeEvent<E, M>>,
     addon_epoch: Arc<AtomicU64>,
     transition: Arc<Mutex<()>>,
+    completion_lifetime: Option<Arc<CompletionLifetime>>,
     declines: Option<DeclineReceiver>,
     #[cfg(test)]
     before_library_child: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
@@ -63,9 +91,10 @@ where
         effects: Vec<Effect>,
         buffer: usize,
     ) -> (Self, Receiver<RuntimeEvent<E, M>>) {
-        let (runtime, rx) = Self::allocate(model, buffer, None);
+        let (tx, rx) = channel(buffer);
+        let runtime = Self::allocate(model, OutputTx::Legacy(tx), None);
         {
-            let _transition = runtime.transition.lock().expect("transition lock failed");
+            let _transition = runtime.lock_transition();
             let plan = ScopedPlan::ordinary(effects, vec![], &EffectScope::Legacy);
             runtime.handle_effects(PlannedEffects {
                 plan,
@@ -84,15 +113,16 @@ where
         model: M,
         effects: Vec<ScopedEffect>,
         scope: EffectScope,
-        buffer: usize,
         declines: DeclineReceiver,
-    ) -> Result<(Self, Receiver<RuntimeEvent<E, M>>), (M, Vec<ScopedEffect>, EffectScope)> {
+    ) -> Result<(Self, RecordedReceiver<RuntimeEvent<E, M>>), (M, Vec<ScopedEffect>, EffectScope)>
+    {
         if !model.supports_recorded_dispatch() || scope.origin().is_none() {
             return Err((model, effects, scope));
         }
-        let (runtime, rx) = Self::allocate(model, buffer, Some(declines));
+        let (tx, rx) = recorded_output::channel();
+        let runtime = Self::allocate(model, OutputTx::Recorded(tx), Some(declines));
         {
-            let _transition = runtime.transition.lock().expect("transition lock failed");
+            let _transition = runtime.lock_transition();
             let mut plan = ScopedPlan::empty(&scope);
             plan.effects = effects;
             runtime.handle_effects(PlannedEffects {
@@ -108,22 +138,29 @@ where
 
     fn allocate(
         model: M,
-        buffer: usize,
+        tx: OutputTx<RuntimeEvent<E, M>>,
         declines: Option<DeclineReceiver>,
-    ) -> (Self, Receiver<RuntimeEvent<E, M>>) {
-        let (tx, rx) = channel(buffer);
-        (
-            Self {
-                model: Arc::new(RwLock::new(model)),
-                tx,
-                addon_epoch: Arc::new(AtomicU64::new(0)),
-                transition: Arc::new(Mutex::new(())),
-                declines,
-                env: PhantomData,
-                #[cfg(test)]
-                before_library_child: Arc::new(Mutex::new(None)),
-            },
-            rx,
+    ) -> Self {
+        let completion_lifetime = declines
+            .as_ref()
+            .map(|_| Arc::new(CompletionLifetime::new()));
+        Self {
+            model: Arc::new(RwLock::new(model)),
+            tx,
+            addon_epoch: Arc::new(AtomicU64::new(0)),
+            transition: Arc::new(Mutex::new(())),
+            completion_lifetime,
+            declines,
+            env: PhantomData,
+            #[cfg(test)]
+            before_library_child: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn lock_transition(&self) -> RecordedTransition<'_, RuntimeEvent<E, M>> {
+        RecordedTransition::new(
+            self.transition.lock().expect("transition lock failed"),
+            self.tx.recorded(),
         )
     }
 
@@ -132,7 +169,7 @@ where
     }
 
     pub fn dispatch(&self, action: RuntimeAction<E, M>) {
-        let _transition = self.transition.lock().expect("transition lock failed");
+        let _transition = self.lock_transition();
         let RuntimeAction { action, field } = action;
         let msg = Msg::Action(action);
         let (planned, scope) = self.plan_action_scoped(&msg, field.as_ref());
@@ -196,13 +233,33 @@ where
 
     #[cfg(test)]
     pub async fn close(&mut self) -> Result<(), anyhow::Error> {
-        self.tx.flush().await?;
-        self.tx.close_channel();
+        self.cancel_pending_completions();
+        match &mut self.tx {
+            OutputTx::Legacy(tx) => {
+                tx.flush().await?;
+                tx.close_channel();
+            }
+            OutputTx::Recorded(tx) => tx.close(),
+        }
         Ok(())
     }
 
     fn emit(&self, event: RuntimeEvent<E, M>) {
-        self.tx.clone().try_send(event).expect("emit event failed");
+        match &self.tx {
+            OutputTx::Legacy(tx) => tx.clone().try_send(event).expect("emit event failed"),
+            OutputTx::Recorded(tx) => {
+                // Ordinary output is constructed by the existing reducer path.
+                // Node allocation precedes queue commit but may still be under the
+                // outer transition/model: this is NOT a whole-reducer allocation fix.
+                let mut prepared = Prepared::new(event);
+                if tx.commit(&mut prepared).is_err() {
+                    // Payload was moved to the outer operation's deferred release.
+                    // This panic still poisons the ordinary transition; unlike the
+                    // completion failure path, that legacy-like behavior is retained.
+                    panic!("emit event failed");
+                }
+            }
+        }
     }
 
     /// Bootstrap and preserved Legacy test entrypoint: no returned Model invocation.
@@ -238,11 +295,7 @@ where
         // This prefix is separately asserted already-admitted by the Model contract.
         // Pairing/UI rejection must not silently erase its pending durable work.
         if let Some(prefix) = prefix {
-            let runtime = self.clone();
-            E::exec_sequential(prefix.future.then(move |events| async move {
-                // Backend/owner/completion-holder guards must already have been released.
-                runtime.handle_completion(events, addon_context);
-            }));
+            self.enqueue_prefix(prefix, addon_context);
         }
         let (direct, ordinary_allowed) = match invocation {
             Some((msg, scope)) if self.declines.is_some() => pair_direct(msg, scope, direct),
@@ -313,16 +366,8 @@ where
         scope: EffectScope,
         addon_context: AddonEffectContext,
     ) {
-        let _transition = self.transition.lock().expect("transition lock failed");
+        let _transition = self.lock_transition();
         self.handle_effect_output_scoped(msg, scope, addon_context);
-    }
-
-    fn handle_completion(&self, events: [Option<Event>; 2], addon_context: AddonEffectContext) {
-        let _transition = self.transition.lock().expect("transition lock failed");
-        // Event-only: never plan_internal, update Ctx/screens, refresh Origin or retry a write.
-        for event in events.into_iter().flatten() {
-            self.emit_core(event, addon_context);
-        }
     }
 
     fn addon_stale(&self, context: AddonEffectContext) -> bool {
@@ -668,6 +713,10 @@ fn is_addon_result(msg: &Msg) -> bool {
 #[cfg(test)]
 #[path = "scoped_dispatch_tests.rs"]
 mod scoped_dispatch_tests;
+
+#[cfg(test)]
+#[path = "delivery_origin_tests.rs"]
+mod delivery_origin_tests;
 
 #[cfg(test)]
 mod tests {

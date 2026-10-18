@@ -8,14 +8,14 @@ use std::sync::mpsc;
 use std::thread;
 
 use chrono::{TimeZone, Utc};
-use futures::{future, Future, StreamExt};
+use futures::{future, Future, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::models::ctx::{plan_library_action, Ctx, CtxError, LibraryActionPlan, OtherError};
 use crate::models::streaming_server::StreamingServer;
 use crate::runtime::{
     AdmissionError, AdmissionReason, ConditionalSend, EnvError, EnvFuture, EnvFutureExt,
-    LocalPrefix, ScopeToken, TryEnvFuture, Update,
+    LocalPrefix, PrefixCompletion, ScopeToken, TryEnvFuture, Update,
 };
 use crate::types::library::{LibraryItem, LibraryItemState};
 use crate::types::notifications::NotificationItem;
@@ -288,9 +288,10 @@ impl Model<RecordingEnv> for ActualCtxHarness {
 
 fn surround(plan: &mut ScopedPlan<Field>, scope: &EffectScope) {
     plan.prefix = Some(LocalPrefix {
+        origin: scope.origin().expect("recorded fixture").clone(),
         future: async {
             EXECUTED.with(|trace| trace.borrow_mut().push("prefix".into()));
-            [None, None]
+            PrefixCompletion::Final([None, None])
         }
         .boxed_env(),
     });
@@ -348,7 +349,7 @@ fn notification(ctx: &mut Ctx) {
         );
 }
 type HarnessRuntime = Runtime<RecordingEnv, ActualCtxHarness>;
-type HarnessRx = Receiver<RuntimeEvent<RecordingEnv, ActualCtxHarness>>;
+type HarnessRx = RecordedReceiver<RuntimeEvent<RecordingEnv, ActualCtxHarness>>;
 fn recorded(
     model: ActualCtxHarness,
 ) -> (HarnessRuntime, HarnessRx, Arc<Mutex<Vec<DeclinedMutation>>>) {
@@ -356,7 +357,7 @@ fn recorded(
     let capture = Arc::clone(&declined);
     let receiver: DeclineReceiver = Arc::new(move |input| capture.lock().unwrap().push(input));
     let scope = EffectScope::recorded(model.token.clone());
-    let (runtime, rx) = match Runtime::new_recorded(model, vec![], scope, 128, receiver) {
+    let (runtime, rx) = match Runtime::new_recorded(model, vec![], scope, receiver) {
         Ok(pair) => pair,
         Err(_) => panic!("fixture construction unexpectedly refused"),
     };
@@ -368,7 +369,9 @@ fn dispatch(runtime: &HarnessRuntime, action: ActionCtx) {
         field: None,
     });
 }
-fn events(rx: &mut HarnessRx) -> Vec<Event> {
+fn events<S: Stream<Item = RuntimeEvent<RecordingEnv, ActualCtxHarness>> + Unpin>(
+    rx: &mut S,
+) -> Vec<Event> {
     let mut output = vec![];
     while let Some(Some(event)) = rx.next().now_or_never() {
         if let RuntimeEvent::CoreEvent(event) = event {
@@ -768,9 +771,10 @@ fn faulty_plan(ctx: &Ctx, scope: &EffectScope, fault: PlanFault) -> ScopedPlan<F
         // Fixture premise: this is separately admitted work, even though the returned
         // pairing metadata is corrupted. It records transfer, NOT Owner publication.
         prefix: Some(LocalPrefix {
+            origin: scope.origin().expect("recorded fixture").clone(),
             future: async {
                 EXECUTED.with(|trace| trace.borrow_mut().push("admitted-prefix".into()));
-                [None, None]
+                PrefixCompletion::Final([None, None])
             }
             .boxed_env(),
         }),
@@ -1022,7 +1026,6 @@ fn common_transport_t13_defaults_bootstrap_and_descendant_refusals() {
         legacy,
         vec![sentinel("must-not-run", &scope)],
         scope.clone(),
-        128,
         declines.clone(),
     ) {
         Err((model, effects, returned_scope)) => {
@@ -1039,7 +1042,6 @@ fn common_transport_t13_defaults_bootstrap_and_descendant_refusals() {
         model,
         vec![sentinel("must-not-run", &missing)],
         missing.clone(),
-        128,
         declines,
     ) {
         Err((model, effects, returned_scope)) => {
