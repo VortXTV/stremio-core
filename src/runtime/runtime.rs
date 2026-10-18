@@ -1,7 +1,11 @@
 use crate::runtime::msg::{Action, ActionCtx, Event, Internal, Msg};
-use crate::runtime::{Effect, EffectFuture, Env, Model};
+use crate::runtime::{
+    admission_error, AdmissionOutcome, DeclineReason, DeclineReceiver, DeclinedMutation,
+    DirectKind, DirectOutcome, Effect, EffectFuture, EffectScope, Env, LibraryContinuation,
+    LibraryUpdateFrame, Model, ProtocolRejection, ScopeDrop, ScopedEffect, ScopedEffectKind,
+    ScopedPlan,
+};
 use derivative::Derivative;
-use enclose::enclose;
 use futures::channel::mpsc::{channel, Receiver, Sender};
 use futures::FutureExt;
 #[cfg(test)]
@@ -31,8 +35,7 @@ struct AddonEffectContext {
 }
 
 struct PlannedEffects<F> {
-    effects: Vec<Effect>,
-    fields: Vec<F>,
+    plan: ScopedPlan<F>,
     addon_context: AddonEffectContext,
 }
 
@@ -43,6 +46,9 @@ pub struct Runtime<E: Env, M: Model<E>> {
     tx: Sender<RuntimeEvent<E, M>>,
     addon_epoch: Arc<AtomicU64>,
     transition: Arc<Mutex<()>>,
+    declines: Option<DeclineReceiver>,
+    #[cfg(test)]
+    before_library_child: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     env: PhantomData<E>,
 }
 
@@ -51,25 +57,18 @@ where
     E: Env + Send + 'static,
     M: Model<E> + Send + Sync + 'static,
 {
+    /// Legacy construction and mutation entrypoints remain exactly opt-out.
     pub fn new(
         model: M,
         effects: Vec<Effect>,
         buffer: usize,
     ) -> (Self, Receiver<RuntimeEvent<E, M>>) {
-        let (tx, rx) = channel(buffer);
-        let model = Arc::new(RwLock::new(model));
-        let runtime = Runtime {
-            model,
-            tx,
-            addon_epoch: Arc::new(AtomicU64::new(0)),
-            transition: Arc::new(Mutex::new(())),
-            env: PhantomData,
-        };
+        let (runtime, rx) = Self::allocate(model, buffer, None);
         {
             let _transition = runtime.transition.lock().expect("transition lock failed");
+            let plan = ScopedPlan::ordinary(effects, vec![], &EffectScope::Legacy);
             runtime.handle_effects(PlannedEffects {
-                effects,
-                fields: vec![],
+                plan,
                 addon_context: AddonEffectContext {
                     epoch: 0,
                     fenced: false,
@@ -78,61 +77,187 @@ where
         }
         (runtime, rx)
     }
+
+    /// Explicit source-unit opt-in. Failed construction returns all owned inputs intact.
+    /// This does not validate storage, hydrate an owner or activate a native backend.
+    pub fn new_recorded(
+        model: M,
+        effects: Vec<ScopedEffect>,
+        scope: EffectScope,
+        buffer: usize,
+        declines: DeclineReceiver,
+    ) -> Result<(Self, Receiver<RuntimeEvent<E, M>>), (M, Vec<ScopedEffect>, EffectScope)> {
+        if !model.supports_recorded_dispatch() || scope.origin().is_none() {
+            return Err((model, effects, scope));
+        }
+        let (runtime, rx) = Self::allocate(model, buffer, Some(declines));
+        {
+            let _transition = runtime.transition.lock().expect("transition lock failed");
+            let mut plan = ScopedPlan::empty(&scope);
+            plan.effects = effects;
+            runtime.handle_effects(PlannedEffects {
+                plan,
+                addon_context: AddonEffectContext {
+                    epoch: 0,
+                    fenced: false,
+                },
+            });
+        }
+        Ok((runtime, rx))
+    }
+
+    fn allocate(
+        model: M,
+        buffer: usize,
+        declines: Option<DeclineReceiver>,
+    ) -> (Self, Receiver<RuntimeEvent<E, M>>) {
+        let (tx, rx) = channel(buffer);
+        (
+            Self {
+                model: Arc::new(RwLock::new(model)),
+                tx,
+                addon_epoch: Arc::new(AtomicU64::new(0)),
+                transition: Arc::new(Mutex::new(())),
+                declines,
+                env: PhantomData,
+                #[cfg(test)]
+                before_library_child: Arc::new(Mutex::new(None)),
+            },
+            rx,
+        )
+    }
+
     pub fn model(&self) -> LockResult<RwLockReadGuard<'_, M>> {
         self.model.read()
     }
+
     pub fn dispatch(&self, action: RuntimeAction<E, M>) {
         let _transition = self.transition.lock().expect("transition lock failed");
-        let planned = self.plan_action(action);
-        self.handle_effects(planned);
+        let RuntimeAction { action, field } = action;
+        let msg = Msg::Action(action);
+        let (planned, scope) = self.plan_action_scoped(&msg, field.as_ref());
+        let addon_context = planned.addon_context;
+        let direct = self.handle_invocation(planned, &msg, &scope);
+        self.finish_bare(msg, scope, direct, addon_context);
     }
-    fn plan_action(&self, action: RuntimeAction<E, M>) -> PlannedEffects<M::Field> {
-        let invalidates_addon_results =
-            action.field.is_none() && is_local_addon_mutation(&action.action);
+
+    fn plan_action_scoped(
+        &self,
+        msg: &Msg,
+        field: Option<&M::Field>,
+    ) -> (PlannedEffects<M::Field>, EffectScope) {
+        let invalidates = field.is_none()
+            && matches!(msg, Msg::Action(action) if is_local_addon_mutation(action));
         let mut model = self.model.write().expect("model write failed");
-        let (effects, fields) = match action {
-            RuntimeAction {
-                field: Some(field),
-                action,
-            } => model.update_field(&Msg::Action(action), &field),
-            RuntimeAction { action, .. } => model.update(&Msg::Action(action)),
+        let scope = if self.declines.is_some() {
+            model
+                .root_scope()
+                .map(EffectScope::recorded)
+                .unwrap_or_else(EffectScope::missing)
+        } else {
+            EffectScope::Legacy
         };
-        if invalidates_addon_results {
+        let plan = if self.declines.is_some() {
+            if scope.origin().is_none() {
+                reject_for(
+                    msg,
+                    &scope,
+                    AdmissionOutcome::DroppedScope(ScopeDrop::Missing),
+                )
+            } else {
+                match field {
+                    Some(field) => model.update_field_scoped(msg, field, &scope),
+                    None => model.update_scoped(msg, &scope),
+                }
+            }
+        } else {
+            let (effects, fields) = match field {
+                Some(field) => model.update_field(msg, field),
+                None => model.update(msg),
+            };
+            ScopedPlan::ordinary(effects, fields, &scope)
+        };
+        // Preserve the existing addon invalidation-on-local-root-attempt rule.
+        if invalidates {
             self.addon_epoch.fetch_add(1, Ordering::SeqCst);
         }
         let addon_context = AddonEffectContext {
             epoch: self.addon_epoch.load(Ordering::SeqCst),
             fenced: false,
         };
-        PlannedEffects {
-            effects,
-            fields,
-            addon_context,
-        }
+        (
+            PlannedEffects {
+                plan,
+                addon_context,
+            },
+            scope,
+        )
     }
+
     #[cfg(test)]
     pub async fn close(&mut self) -> Result<(), anyhow::Error> {
         self.tx.flush().await?;
         self.tx.close_channel();
         Ok(())
     }
+
     fn emit(&self, event: RuntimeEvent<E, M>) {
         self.tx.clone().try_send(event).expect("emit event failed");
     }
-    fn handle_effects(&self, planned: PlannedEffects<M::Field>) {
+
+    /// Bootstrap and preserved Legacy test entrypoint: no returned Model invocation.
+    fn handle_effects(&self, planned: PlannedEffects<M::Field>) -> DirectOutcome {
+        self.deliver_plan(planned, None)
+    }
+
+    /// Every actual Model invocation pairs before its ordinary output is authorized.
+    fn handle_invocation(
+        &self,
+        planned: PlannedEffects<M::Field>,
+        msg: &Msg,
+        scope: &EffectScope,
+    ) -> DirectOutcome {
+        self.deliver_plan(planned, Some((msg, scope)))
+    }
+
+    fn deliver_plan(
+        &self,
+        planned: PlannedEffects<M::Field>,
+        invocation: Option<(&Msg, &EffectScope)>,
+    ) -> DirectOutcome {
         let PlannedEffects {
-            effects,
-            fields,
+            plan,
             addon_context,
         } = planned;
-        if addon_context.fenced && addon_context.epoch != self.addon_epoch.load(Ordering::SeqCst) {
-            return;
+        let ScopedPlan {
+            effects,
+            fields,
+            prefix,
+            direct,
+        } = plan;
+        // This prefix is separately asserted already-admitted by the Model contract.
+        // Pairing/UI rejection must not silently erase its pending durable work.
+        if let Some(prefix) = prefix {
+            let runtime = self.clone();
+            E::exec_sequential(prefix.future.then(move |events| async move {
+                // Backend/owner/completion-holder guards must already have been released.
+                runtime.handle_completion(events, addon_context);
+            }));
+        }
+        let (direct, ordinary_allowed) = match invocation {
+            Some((msg, scope)) if self.declines.is_some() => pair_direct(msg, scope, direct),
+            _ => (direct, true), // Legacy output is not a recorded admission claim.
+        };
+        // Drop only this invocation's still-owned ordinary output. Parent/siblings
+        // are on the surrounding Runtime stack and remain independently traversable.
+        if !ordinary_allowed || self.addon_stale(addon_context) {
+            return direct;
         }
         if !fields.is_empty() {
             if addon_context.fenced {
                 let model = self.model.read().expect("model read failed");
-                if addon_context.epoch != self.addon_epoch.load(Ordering::SeqCst) {
-                    return;
+                if self.addon_stale(addon_context) {
+                    return direct;
                 }
                 #[cfg(test)]
                 let snapshot = model.to_owned();
@@ -151,83 +276,367 @@ where
                     model.to_owned(),
                 ));
             }
-        };
-        effects
-            .into_iter()
-            .for_each(enclose!((self.clone() => runtime) move |effect| {
-                match effect {
-                    Effect::Msg(msg) => {
-                        runtime.handle_effect_output(*msg, addon_context);
-                    }
-                    Effect::Future(EffectFuture::Sequential(future)) => {
-                        E::exec_sequential(future.then(enclose!((runtime) move |msg| async move {
-                            runtime.handle_scheduled_effect_output(msg, addon_context);
-                        })))
-                    },
-                    Effect::Future(EffectFuture::Concurrent(future)) => {
-                        E::exec_concurrent(future.then(enclose!((runtime) move |msg| async move {
-                            runtime.handle_scheduled_effect_output(msg, addon_context);
-                        })))
-                    }
-                }
-            }));
+        }
+        for effect in effects {
+            self.handle_one(effect, addon_context);
+        }
+        direct
     }
-    fn handle_scheduled_effect_output(&self, msg: Msg, addon_context: AddonEffectContext) {
-        let _transition = self.transition.lock().expect("transition lock failed");
-        self.handle_effect_output(msg, addon_context);
-    }
-    fn handle_effect_output(&self, msg: Msg, addon_context: AddonEffectContext) {
-        match msg {
-            Msg::Event(event) => {
-                if addon_context.fenced {
-                    let model = self.model.read().expect("model read failed");
-                    if addon_context.epoch != self.addon_epoch.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    self.emit(RuntimeEvent::CoreEvent(event));
-                    drop(model);
-                } else {
-                    self.emit(RuntimeEvent::CoreEvent(event));
-                }
+
+    fn handle_one(&self, effect: ScopedEffect, addon_context: AddonEffectContext) {
+        let ScopedEffect { effect, scope } = effect;
+        match effect {
+            ScopedEffectKind::LibraryUpdateThen(frame) => {
+                self.handle_library_frame(frame, scope, addon_context)
             }
-            Msg::Internal(_) => {
-                if let Some(planned) = self.plan_internal(&msg, addon_context) {
-                    self.handle_effects(planned);
-                }
+            ScopedEffectKind::Ordinary(Effect::Msg(msg)) => {
+                self.handle_effect_output_scoped(*msg, scope, addon_context)
             }
-            Msg::Action(_) => {
-                panic!("effects are not allowed to resolve with action");
+            ScopedEffectKind::Ordinary(Effect::Future(EffectFuture::Sequential(future))) => {
+                let runtime = self.clone();
+                E::exec_sequential(future.then(move |msg| async move {
+                    runtime.handle_scheduled_effect_output(msg, scope, addon_context);
+                }));
+            }
+            ScopedEffectKind::Ordinary(Effect::Future(EffectFuture::Concurrent(future))) => {
+                let runtime = self.clone();
+                E::exec_concurrent(future.then(move |msg| async move {
+                    runtime.handle_scheduled_effect_output(msg, scope, addon_context);
+                }));
             }
         }
     }
-    fn plan_internal(
+
+    fn handle_scheduled_effect_output(
+        &self,
+        msg: Msg,
+        scope: EffectScope,
+        addon_context: AddonEffectContext,
+    ) {
+        let _transition = self.transition.lock().expect("transition lock failed");
+        self.handle_effect_output_scoped(msg, scope, addon_context);
+    }
+
+    fn handle_completion(&self, events: [Option<Event>; 2], addon_context: AddonEffectContext) {
+        let _transition = self.transition.lock().expect("transition lock failed");
+        // Event-only: never plan_internal, update Ctx/screens, refresh Origin or retry a write.
+        for event in events.into_iter().flatten() {
+            self.emit_core(event, addon_context);
+        }
+    }
+
+    fn addon_stale(&self, context: AddonEffectContext) -> bool {
+        context.fenced && context.epoch != self.addon_epoch.load(Ordering::SeqCst)
+    }
+
+    fn emit_core(&self, event: Event, addon_context: AddonEffectContext) {
+        if addon_context.fenced {
+            let model = self.model.read().expect("model read failed");
+            if self.addon_stale(addon_context) {
+                return;
+            }
+            self.emit(RuntimeEvent::CoreEvent(event));
+            drop(model);
+        } else {
+            self.emit(RuntimeEvent::CoreEvent(event));
+        }
+    }
+
+    fn handle_effect_output_scoped(
+        &self,
+        msg: Msg,
+        scope: EffectScope,
+        addon_context: AddonEffectContext,
+    ) {
+        match msg {
+            Msg::Event(event) => self.emit_core(event, addon_context),
+            Msg::Internal(_) => {
+                if matches!(&msg, Msg::Internal(Internal::UpdateLibraryItem(_))) {
+                    self.run_before_library_child();
+                }
+                let planned = self.plan_internal_scoped(&msg, &scope, addon_context);
+                let context = planned.addon_context;
+                let direct = self.handle_invocation(planned, &msg, &scope);
+                self.finish_bare(msg, scope, direct, context);
+            }
+            Msg::Action(_) => panic!("effects are not allowed to resolve with action"),
+        }
+    }
+
+    fn plan_internal_scoped(
         &self,
         msg: &Msg,
+        scope: &EffectScope,
         addon_context: AddonEffectContext,
-    ) -> Option<PlannedEffects<M::Field>> {
-        let addon_context = AddonEffectContext {
+    ) -> PlannedEffects<M::Field> {
+        let context = AddonEffectContext {
             fenced: addon_context.fenced || is_addon_result(msg),
             ..addon_context
         };
         let mut model = self.model.write().expect("model write failed");
-        if addon_context.fenced && addon_context.epoch != self.addon_epoch.load(Ordering::SeqCst) {
-            return None;
-        }
-        let (effects, fields) = model.update(msg);
-        let addon_context = if addon_context.fenced {
-            addon_context
+        let plan = if self.addon_stale(context) {
+            if self.declines.is_some() {
+                reject_for(
+                    msg,
+                    scope,
+                    AdmissionOutcome::DroppedScope(ScopeDrop::AddonEpoch),
+                )
+            } else {
+                ScopedPlan::empty(scope)
+            }
+        } else if self.declines.is_some() {
+            if matches!(scope, EffectScope::Legacy) {
+                reject_for(
+                    msg,
+                    scope,
+                    AdmissionOutcome::ProtocolRejected(ProtocolRejection::WrongScope),
+                )
+            } else if scope.origin().is_none() {
+                reject_for(
+                    msg,
+                    scope,
+                    AdmissionOutcome::DroppedScope(ScopeDrop::Missing),
+                )
+            } else {
+                model.update_scoped(msg, scope)
+            }
+        } else {
+            let (effects, fields) = model.update(msg);
+            ScopedPlan::ordinary(effects, fields, scope)
+        };
+        let context = if context.fenced {
+            context
         } else {
             AddonEffectContext {
                 epoch: self.addon_epoch.load(Ordering::SeqCst),
                 fenced: false,
             }
         };
-        Some(PlannedEffects {
-            effects,
-            fields,
-            addon_context,
-        })
+        PlannedEffects {
+            plan,
+            addon_context: context,
+        }
     }
+
+    fn handle_library_frame(
+        &self,
+        frame: LibraryUpdateFrame,
+        scope: EffectScope,
+        addon_context: AddonEffectContext,
+    ) {
+        let (item, continuation) = frame.into_parts();
+        let valid = item.id == continuation.id();
+        let msg = Msg::Internal(Internal::UpdateLibraryItem(item));
+        if !valid {
+            self.decline(
+                msg,
+                scope,
+                DeclineReason::Protocol(ProtocolRejection::InvalidFrame),
+                Some(continuation),
+            );
+            return;
+        }
+        self.run_before_library_child();
+        let planned = self.plan_internal_scoped(&msg, &scope, addon_context);
+        let context = planned.addon_context;
+        let direct = self.handle_invocation(planned, &msg, &scope);
+        // pair_direct normalizes every rejected library invocation to its original
+        // LibraryItem subject; no second, weaker frame-specific pairing rule.
+        let outcome = match direct.kind {
+            DirectKind::LibraryItem { outcome, .. } => outcome,
+            _ => unreachable!("library invocation must be normalized by pair_direct"),
+        };
+        match outcome {
+            AdmissionOutcome::AcceptedChange | AdmissionOutcome::AcceptedNoChange => {
+                for msg in continuation.accepted() {
+                    self.handle_effect_output_scoped(msg, scope.descendant(), context);
+                }
+            }
+            AdmissionOutcome::RefusedCurrent(reason) => {
+                let error = admission_error(continuation.source(), reason);
+                self.decline(
+                    msg,
+                    scope,
+                    DeclineReason::Current(reason),
+                    Some(continuation),
+                );
+                self.emit_core(error, context);
+            }
+            AdmissionOutcome::DroppedScope(reason) => {
+                self.decline(msg, scope, DeclineReason::Scope(reason), Some(continuation))
+            }
+            AdmissionOutcome::ProtocolRejected(reason) => self.decline(
+                msg,
+                scope,
+                DeclineReason::Protocol(reason),
+                Some(continuation),
+            ),
+            AdmissionOutcome::DomainDenied => {} // paired domain outcome: no success continuation
+        }
+    }
+
+    fn finish_bare(
+        &self,
+        msg: Msg,
+        scope: EffectScope,
+        direct: DirectOutcome,
+        addon_context: AddonEffectContext,
+    ) {
+        if self.declines.is_none() {
+            return;
+        } // Legacy never produces recorded dispositions.
+          // Only called with handle_invocation's paired/normalized direct outcome.
+        let (outcome, source) = match direct.kind {
+            DirectKind::Ungoverned => return, // valid only for non-library inputs
+            DirectKind::LibraryItem { outcome, .. } => (outcome, None),
+            DirectKind::Other {
+                outcome,
+                error_source,
+            } => (outcome, error_source),
+        };
+        match outcome {
+            AdmissionOutcome::RefusedCurrent(reason) => {
+                self.decline(msg, scope, DeclineReason::Current(reason), None);
+                if let Some(source) = source {
+                    self.emit_core(admission_error(source, reason), addon_context);
+                }
+            }
+            AdmissionOutcome::DroppedScope(reason) => {
+                self.decline(msg, scope, DeclineReason::Scope(reason), None)
+            }
+            AdmissionOutcome::ProtocolRejected(reason) => {
+                self.decline(msg, scope, DeclineReason::Protocol(reason), None)
+            }
+            AdmissionOutcome::AcceptedChange
+            | AdmissionOutcome::AcceptedNoChange
+            | AdmissionOutcome::DomainDenied => {}
+        }
+    }
+
+    fn decline(
+        &self,
+        input: Msg,
+        scope: EffectScope,
+        reason: DeclineReason,
+        continuation: Option<LibraryContinuation>,
+    ) {
+        // A LibraryUpdateThen can arise only in new_recorded's scoped plan type.
+        // No model/owner guard is held. The required receiver must not reenter/await.
+        let receiver = self
+            .declines
+            .as_ref()
+            .expect("recorded effect requires decline receiver");
+        receiver(DeclinedMutation {
+            input,
+            scope,
+            reason,
+            continuation,
+        });
+    }
+
+    fn run_before_library_child(&self) {
+        // Test-only rendezvous after parent planning/model unlock, before child planning.
+        // The hook holder mutex is dropped before the hook runs. No production callback.
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_library_child
+                .lock()
+                .expect("hook lock failed")
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    // Keep existing addon-fence unit tests byte-identical while production uses the
+    // explicitly scoped entrypoints. These adapters are Legacy-only test call sites.
+    #[cfg(test)]
+    fn plan_action(&self, action: RuntimeAction<E, M>) -> PlannedEffects<M::Field> {
+        assert!(self.declines.is_none());
+        self.plan_action_scoped(&Msg::Action(action.action), action.field.as_ref())
+            .0
+    }
+    #[cfg(test)]
+    fn plan_internal(
+        &self,
+        msg: &Msg,
+        context: AddonEffectContext,
+    ) -> Option<PlannedEffects<M::Field>> {
+        assert!(self.declines.is_none());
+        let planned = self.plan_internal_scoped(msg, &EffectScope::Legacy, context);
+        if self.addon_stale(planned.addon_context) {
+            None
+        } else {
+            Some(planned)
+        }
+    }
+    #[cfg(test)]
+    fn handle_effect_output(&self, msg: Msg, context: AddonEffectContext) {
+        assert!(self.declines.is_none());
+        self.handle_effect_output_scoped(msg, EffectScope::Legacy, context);
+    }
+}
+
+/// One pairing rule for roots, bare internals and framed library children.
+fn pair_direct(msg: &Msg, scope: &EffectScope, direct: DirectOutcome) -> (DirectOutcome, bool) {
+    let reject = |reason| {
+        (
+            direct_for(msg, scope, AdmissionOutcome::ProtocolRejected(reason)),
+            false,
+        )
+    };
+    if !direct.scope.same_scope(scope) {
+        return reject(ProtocolRejection::WrongScope);
+    }
+    match (msg, &direct.kind) {
+        (Msg::Internal(Internal::UpdateLibraryItem(item)), DirectKind::LibraryItem { id, .. }) => {
+            if &item.id != id {
+                return reject(ProtocolRejection::WrongSubject);
+            }
+        }
+        (
+            Msg::Internal(Internal::UpdateLibraryItem(_)),
+            DirectKind::Other {
+                outcome: AdmissionOutcome::ProtocolRejected(reason),
+                ..
+            },
+        ) => return reject(*reason), // explicit rejection only; supplied source discarded
+        (Msg::Internal(Internal::UpdateLibraryItem(_)), DirectKind::Other { .. }) => {
+            return reject(ProtocolRejection::WrongSubject)
+        }
+        (Msg::Internal(Internal::UpdateLibraryItem(_)), DirectKind::Ungoverned) => {
+            return reject(ProtocolRejection::MissingOutcome)
+        }
+        (_, DirectKind::LibraryItem { .. }) => return reject(ProtocolRejection::WrongSubject),
+        _ => {}
+    }
+    let ordinary_allowed = match &direct.kind {
+        DirectKind::Ungoverned => true, // never library input after the checks above
+        DirectKind::LibraryItem { outcome, .. } | DirectKind::Other { outcome, .. } => matches!(
+            outcome,
+            AdmissionOutcome::AcceptedChange
+                | AdmissionOutcome::AcceptedNoChange
+                | AdmissionOutcome::DomainDenied
+        ),
+    };
+    (direct, ordinary_allowed)
+}
+
+fn direct_for(msg: &Msg, scope: &EffectScope, outcome: AdmissionOutcome) -> DirectOutcome {
+    match msg {
+        Msg::Internal(Internal::UpdateLibraryItem(item)) => {
+            DirectOutcome::library(scope, item.id.clone(), outcome)
+        }
+        _ => DirectOutcome::rejected(scope, outcome),
+    }
+}
+
+fn reject_for<F>(msg: &Msg, scope: &EffectScope, outcome: AdmissionOutcome) -> ScopedPlan<F> {
+    let mut plan = ScopedPlan::empty(scope);
+    plan.direct = direct_for(msg, scope, outcome);
+    plan
 }
 
 fn is_local_addon_mutation(action: &Action) -> bool {
@@ -255,6 +664,10 @@ fn is_addon_result(msg: &Msg) -> bool {
         )
     )
 }
+
+#[cfg(test)]
+#[path = "scoped_dispatch_tests.rs"]
+mod scoped_dispatch_tests;
 
 #[cfg(test)]
 mod tests {

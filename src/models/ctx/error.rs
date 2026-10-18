@@ -1,4 +1,4 @@
-use crate::runtime::EnvError;
+use crate::runtime::{AdmissionError, EnvError};
 use crate::types::api::APIError;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
@@ -10,6 +10,7 @@ pub enum CtxError {
     API(APIError),
     Env(EnvError),
     Other(OtherError),
+    Admission(AdmissionError),
 }
 
 impl From<APIError> for CtxError {

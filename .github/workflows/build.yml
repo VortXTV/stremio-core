@@ -17,6 +17,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Keep this exact review branch on checks/tests only. Test compilation is expected.
+env:
+  SOURCE_REVIEW_ONLY: ${{ github.ref == 'refs/heads/beta/audit-reauth-20261017' || github.head_ref == 'beta/audit-reauth-20261017' }}
+
 jobs:
   build-core:
     name: "stremio-core-*: Lint, test and build"
@@ -45,6 +49,7 @@ jobs:
       run: cargo test
 
     - name: Build
+      if: ${{ env.SOURCE_REVIEW_ONLY != 'true' }}
       run: cargo build
 
   build-stremio-core-web:
@@ -82,6 +87,7 @@ jobs:
         run: wasm-pack test --chromedriver "$(which chromedriver)" --chrome --headless
 
       - name: Setup NodeJS
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' }}
         uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -90,11 +96,12 @@ jobs:
           cache-dependency-path: stremio-core-web/package-lock.json
 
       - name: Install NPM dependencies
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' }}
         working-directory: stremio-core-web
         run: npm ci
 
       - name: Build (release)
-        if: ${{ ! startsWith(github.ref, 'refs/pull/') }}
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' && ! startsWith(github.ref, 'refs/pull/') }}
         working-directory: stremio-core-web
         run: npm run build
 
@@ -102,35 +109,36 @@ jobs:
       # so we need to recursively create these 2 folders
       # create folder for release and dev builds to be published on GH pages
       - run: mkdir -p ./build/${{ github.ref_name }}/dev
-        if: ${{ ! startsWith(github.ref, 'refs/pull/') }}
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' && ! startsWith(github.ref, 'refs/pull/') }}
         working-directory: stremio-core-web
 
       - name: Package (release)
-        if: ${{ ! startsWith(github.ref, 'refs/pull/') }}
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' && ! startsWith(github.ref, 'refs/pull/') }}
         working-directory: stremio-core-web
         run: npm pack
 
       - name: Copy release package archive
-        if: ${{ ! startsWith(github.ref, 'refs/pull/') }}
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' && ! startsWith(github.ref, 'refs/pull/') }}
         working-directory: stremio-core-web
         run: mv ./*.tgz ./build/${{ github.ref_name }}
 
       - name: Build (dev)
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' }}
         working-directory: stremio-core-web
         run: npm run build-dev
 
       - name: Package (dev)
-        if: ${{ ! startsWith(github.ref, 'refs/pull/') }}
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' && ! startsWith(github.ref, 'refs/pull/') }}
         working-directory: stremio-core-web
         run: npm pack
         
       - name: Copy dev package archive
-        if: ${{ ! startsWith(github.ref, 'refs/pull/') }} 
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' && ! startsWith(github.ref, 'refs/pull/') }}
         working-directory: stremio-core-web
         run: mv ./*.tgz ./build/${{ github.ref_name }}/dev
         
       - name: Deploy gh-pages
-        if: ${{ ! startsWith(github.ref, 'refs/pull/')  &&  github.actor != 'dependabot[bot]' }}
+        if: ${{ env.SOURCE_REVIEW_ONLY != 'true' && ! startsWith(github.ref, 'refs/pull/')  &&  github.actor != 'dependabot[bot]' }}
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}

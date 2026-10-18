@@ -4,6 +4,9 @@ use update_events::*;
 mod update_library;
 use update_library::*;
 
+mod library_action;
+pub use library_action::{plan_library_action, LibraryActionPlan};
+
 mod update_notifications;
 use update_notifications::*;
 

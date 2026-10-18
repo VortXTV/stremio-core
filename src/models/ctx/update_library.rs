@@ -10,7 +10,7 @@ use crate::{
         LIBRARY_COLLECTION_NAME, LIBRARY_RECENT_COUNT, LIBRARY_RECENT_STORAGE_KEY,
         LIBRARY_STORAGE_KEY,
     },
-    models::ctx::{CtxError, CtxStatus, OtherError},
+    models::ctx::{plan_library_action, CtxError, CtxStatus, OtherError},
     runtime::{
         msg::{Action, ActionCtx, CtxAuthResponse, Event, Internal, Msg},
         Effect, EffectFuture, Effects, Env, EnvFutureExt,
@@ -31,6 +31,9 @@ pub fn update_library<E: Env + 'static>(
     status: &CtxStatus,
     msg: &Msg,
 ) -> Effects {
+    if let Some(plan) = plan_library_action::<E>(library, msg) {
+        return plan.into_legacy();
+    }
     let auth_key = profile.auth_key();
     match msg {
         Msg::Internal(Internal::Logout(_)) => {
@@ -40,94 +43,6 @@ pub fn update_library<E: Env + 'static>(
                 Effects::msg(Msg::Internal(Internal::LibraryChanged(false)))
             } else {
                 Effects::none().unchanged()
-            }
-        }
-        Msg::Action(Action::Ctx(ActionCtx::AddToLibrary(meta_preview))) => {
-            let mut library_item = match library.items.get(&meta_preview.id) {
-                Some(library_item) => LibraryItem::from((meta_preview, library_item)),
-                _ => LibraryItem::from((meta_preview, PhantomData::<E>)),
-            };
-            library_item.removed = false;
-            library_item.temp = false;
-            Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item)))
-                .join(Effects::msg(Msg::Event(Event::LibraryItemAdded {
-                    id: meta_preview.id.to_owned(),
-                })))
-                .unchanged()
-        }
-        Msg::Action(Action::Ctx(ActionCtx::RemoveFromLibrary(id))) => match library.items.get(id) {
-            Some(library_item) => {
-                let mut library_item = library_item.to_owned();
-                library_item.removed = true;
-                library_item.temp = false;
-
-                // Dismiss any notification for the LibraryItem
-                // whether no_notifs is enabled or not, we do not care.
-                // we will dismiss the notifs. and remove the item from CW.
-                let notifications_effects = Effects::msg(Msg::Internal(
-                    Internal::DismissNotificationItem(id.to_owned()),
-                ))
-                .unchanged();
-
-                Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item)))
-                    .join(notifications_effects)
-                    .join(Effects::msg(Msg::Event(Event::LibraryItemRemoved {
-                        id: id.to_owned(),
-                    })))
-                    .unchanged()
-            }
-            _ => Effects::msg(Msg::Event(Event::Error {
-                error: CtxError::from(OtherError::LibraryItemNotFound),
-                source: Box::new(Event::LibraryItemRemoved { id: id.to_owned() }),
-            }))
-            .unchanged(),
-        },
-        Msg::Action(Action::Ctx(ActionCtx::RewindLibraryItem(id))) => match library.items.get(id) {
-            Some(library_item) => {
-                let mut library_item = library_item.to_owned();
-                library_item.state.time_offset = 0;
-
-                Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item)))
-                    .join(Effects::msg(Msg::Event(Event::LibraryItemRewinded {
-                        id: id.to_owned(),
-                    })))
-                    .unchanged()
-            }
-            _ => Effects::msg(Msg::Event(Event::Error {
-                error: CtxError::from(OtherError::LibraryItemNotFound),
-                source: Box::new(Event::LibraryItemRewinded { id: id.to_owned() }),
-            }))
-            .unchanged(),
-        },
-        Msg::Action(Action::Ctx(ActionCtx::ToggleLibraryItemNotifications(id, state))) => {
-            match library.items.get(id) {
-                Some(library_item) => {
-                    let mut library_item = library_item.to_owned();
-                    library_item.state.no_notif = *state;
-
-                    // if we have `no_notif` set to `true` (we don't want notifications for the LibraryItem)
-                    // we want to dismiss any notifications for the LibraryItem that exist
-                    let notifications_effects = if library_item.state.no_notif {
-                        Effects::msg(Msg::Internal(Internal::DismissNotificationItem(
-                            id.to_owned(),
-                        )))
-                        .unchanged()
-                    } else {
-                        Effects::none().unchanged()
-                    };
-
-                    Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item)))
-                        .join(Effects::msg(Msg::Event(
-                            Event::LibraryItemNotificationsToggled { id: id.to_owned() },
-                        )))
-                        .join(notifications_effects)
-                        .unchanged()
-                }
-                _ => Effects::msg(Msg::Event(Event::Error {
-                    error: CtxError::from(OtherError::LibraryItemNotFound),
-                    source: Box::new(Event::LibraryItemNotificationsToggled { id: id.to_owned() }),
-                }))
-                .unchanged(),
             }
         }
         Msg::Action(Action::Ctx(ActionCtx::SyncLibraryWithAPI)) => match auth_key {
