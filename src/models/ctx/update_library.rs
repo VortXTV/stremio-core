@@ -31,6 +31,38 @@ pub fn update_library<E: Env + 'static>(
     status: &CtxStatus,
     msg: &Msg,
 ) -> Effects {
+    update_library_with::<E, _>(library, profile, status, msg, &mut LegacyLibraryMutation)
+}
+/// Only the existing merge/full-storage constructor sites are intercepted.
+/// The caller admits NoChange and validates notification coverage separately.
+pub trait LibraryMutation {
+    fn items<E: Env + 'static>(
+        &mut self,
+        library: &mut LibraryBucket,
+        items: Vec<LibraryItem>,
+    ) -> Effects;
+    fn full<E: Env + 'static>(&mut self, library: &LibraryBucket) -> Effects;
+}
+struct LegacyLibraryMutation;
+impl LibraryMutation for LegacyLibraryMutation {
+    fn items<E: Env + 'static>(
+        &mut self,
+        library: &mut LibraryBucket,
+        items: Vec<LibraryItem>,
+    ) -> Effects {
+        Effects::one(update_and_push_items_to_storage::<E>(library, items))
+    }
+    fn full<E: Env + 'static>(&mut self, library: &LibraryBucket) -> Effects {
+        Effects::one(push_library_to_storage::<E>(library)).unchanged()
+    }
+}
+pub fn update_library_with<E: Env + 'static, M: LibraryMutation>(
+    library: &mut LibraryBucket,
+    profile: &Profile,
+    status: &CtxStatus,
+    msg: &Msg,
+    mutation: &mut M,
+) -> Effects {
     if let Some(plan) = plan_library_action::<E>(library, msg) {
         return plan.into_legacy();
     }
@@ -98,17 +130,14 @@ pub fn update_library<E: Env + 'static>(
                 _ => Effects::none().unchanged(),
             };
 
-            let push_to_storage_effects = Effects::one(update_and_push_items_to_storage::<E>(
-                library,
-                vec![library_item],
-            ));
+            let push_to_storage_effects = mutation.items::<E>(library, vec![library_item]);
 
             push_to_api_effects
                 .join(push_to_storage_effects)
                 .join(Effects::msg(Msg::Internal(Internal::LibraryChanged(true))))
         }
         Msg::Internal(Internal::LibraryChanged(persisted)) if !persisted => {
-            Effects::one(push_library_to_storage::<E>(library)).unchanged()
+            mutation.full::<E>(library)
         }
         Msg::Internal(Internal::CtxAuthResult(auth_request, result)) => match (status, result) {
             (
@@ -204,10 +233,7 @@ pub fn update_library<E: Env + 'static>(
                     .join(Effects::msg(Msg::Event(Event::LibraryItemsPulledFromAPI {
                         ids: ids.to_owned(),
                     })))
-                    .join(Effects::one(update_and_push_items_to_storage::<E>(
-                        library,
-                        items.to_owned(),
-                    )))
+                    .join(mutation.items::<E>(library, items.to_owned()))
                     .join(Effects::msg(Msg::Internal(Internal::LibraryChanged(true))))
             }
             Err(error) => Effects::msg(Msg::Event(Event::Error {

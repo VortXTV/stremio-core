@@ -6,6 +6,8 @@ use update_library::*;
 
 mod library_action;
 pub use library_action::{plan_library_action, LibraryActionPlan};
+pub use update_library::{update_library_with, LibraryMutation};
+pub use update_profile::{update_profile_with, ProfileMutation};
 
 mod update_notifications;
 use update_notifications::*;

@@ -19,6 +19,28 @@ enum AddonRemoteWrite {
     Enabled,
     Disabled,
 }
+/// A synchronous mutation boundary, not an executor or storage backend.
+/// Recorded implementations prepare a prospective Profile off guard and admit
+/// its replacement before dependent stream cleanup or API constructors run.
+pub trait ProfileMutation {
+    fn apply(
+        &mut self,
+        profile: &mut Profile,
+        persist: bool,
+        edit: impl FnOnce(&mut Profile),
+    ) -> bool;
+    fn notification<E: Env + 'static>(&mut self, profile: &Profile) -> Effects;
+}
+struct LegacyProfileMutation;
+impl ProfileMutation for LegacyProfileMutation {
+    fn apply(&mut self, profile: &mut Profile, _: bool, edit: impl FnOnce(&mut Profile)) -> bool {
+        edit(profile);
+        true
+    }
+    fn notification<E: Env + 'static>(&mut self, profile: &Profile) -> Effects {
+        Effects::one(push_profile_to_storage::<E>(profile)).unchanged()
+    }
+}
 
 pub fn update_profile<E: Env + 'static>(
     profile: &mut Profile,
@@ -26,11 +48,22 @@ pub fn update_profile<E: Env + 'static>(
     status: &CtxStatus,
     msg: &Msg,
 ) -> Effects {
+    update_profile_with::<E, _>(profile, streams, status, msg, &mut LegacyProfileMutation)
+}
+pub fn update_profile_with<E: Env + 'static, M: ProfileMutation>(
+    profile: &mut Profile,
+    streams: &mut StreamsBucket,
+    status: &CtxStatus,
+    msg: &Msg,
+    mutation: &mut M,
+) -> Effects {
     match msg {
         Msg::Internal(Internal::Logout(_)) => {
             let next_profile = Profile::default();
             if *profile != next_profile {
-                *profile = next_profile;
+                if !mutation.apply(profile, true, |profile| *profile = next_profile) {
+                    return Effects::none().unchanged();
+                }
                 Effects::msg(Msg::Internal(Internal::ProfileChanged))
             } else {
                 Effects::none().unchanged()
@@ -128,7 +161,9 @@ pub fn update_profile<E: Env + 'static>(
                     .chain(removed_transport_urls)
                     .collect();
                 if profile.addons != next_addons {
-                    profile.addons = next_addons;
+                    if !mutation.apply(profile, true, |profile| profile.addons = next_addons) {
+                        return Effects::none().unchanged();
+                    }
                     Effects::msg(Msg::Event(Event::AddonsPulledFromAPI { transport_urls }))
                         .join(Effects::msg(Msg::Internal(Internal::ProfileChanged)))
                 } else {
@@ -151,30 +186,51 @@ pub fn update_profile<E: Env + 'static>(
         )
         .unchanged(),
         Msg::Action(Action::Ctx(ActionCtx::UpgradeAddon(addon))) => {
-            upgrade_addon::<E>(profile, addon, AddonRemoteWrite::Enabled)
+            upgrade_addon::<E, _>(profile, addon, AddonRemoteWrite::Enabled, mutation)
         }
         Msg::Action(Action::Ctx(ActionCtx::UpgradeAddonLocal(addon))) => {
-            upgrade_addon::<E>(profile, addon, AddonRemoteWrite::Disabled)
+            upgrade_addon::<E, _>(profile, addon, AddonRemoteWrite::Disabled, mutation)
         }
-        Msg::Action(Action::Ctx(ActionCtx::ReplaceAddon { old, new })) => {
-            replace_addon::<E>(profile, streams, old, new, AddonRemoteWrite::Enabled)
-        }
+        Msg::Action(Action::Ctx(ActionCtx::ReplaceAddon { old, new })) => replace_addon::<E, _>(
+            profile,
+            streams,
+            old,
+            new,
+            AddonRemoteWrite::Enabled,
+            mutation,
+        ),
         Msg::Action(Action::Ctx(ActionCtx::ReplaceAddonLocal { old, new })) => {
-            replace_addon::<E>(profile, streams, old, new, AddonRemoteWrite::Disabled)
+            replace_addon::<E, _>(
+                profile,
+                streams,
+                old,
+                new,
+                AddonRemoteWrite::Disabled,
+                mutation,
+            )
         }
         Msg::Action(Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(addons))) => {
-            replace_addon_projection_local(profile, streams, addons)
+            replace_addon_projection_local(profile, streams, addons, mutation)
         }
         Msg::Internal(Internal::UninstallAddon(addon)) => {
-            uninstall_addon::<E>(profile, streams, addon, AddonRemoteWrite::Enabled)
+            uninstall_addon::<E, _>(profile, streams, addon, AddonRemoteWrite::Enabled, mutation)
         }
-        Msg::Internal(Internal::UninstallAddonLocal(addon)) => {
-            uninstall_addon::<E>(profile, streams, addon, AddonRemoteWrite::Disabled)
-        }
-        Msg::Action(Action::Ctx(ActionCtx::LogoutTrakt)) => match &mut profile.auth {
-            Some(Auth { user, key }) => {
+        Msg::Internal(Internal::UninstallAddonLocal(addon)) => uninstall_addon::<E, _>(
+            profile,
+            streams,
+            addon,
+            AddonRemoteWrite::Disabled,
+            mutation,
+        ),
+        Msg::Action(Action::Ctx(ActionCtx::LogoutTrakt)) => match &profile.auth {
+            Some(Auth { user, .. }) => {
                 if user.trakt.is_some() {
-                    user.trakt = None;
+                    if !mutation.apply(profile, true, |profile| {
+                        profile.auth.as_mut().expect("checked auth").user.trakt = None;
+                    }) {
+                        return Effects::none().unchanged();
+                    }
+                    let Auth { user, key } = profile.auth.as_ref().expect("admitted auth");
                     let push_to_api_effects =
                         Effects::one(push_user_to_api::<E>(user.to_owned(), key));
 
@@ -196,7 +252,11 @@ pub fn update_profile<E: Env + 'static>(
         },
         Msg::Action(Action::Ctx(ActionCtx::UpdateSettings(settings))) => {
             if profile.settings != *settings {
-                settings.clone_into(&mut profile.settings);
+                if !mutation.apply(profile, true, |profile| {
+                    settings.clone_into(&mut profile.settings)
+                }) {
+                    return Effects::none().unchanged();
+                }
                 Effects::msg(Msg::Event(Event::SettingsUpdated {
                     settings: settings.to_owned(),
                 }))
@@ -208,14 +268,12 @@ pub fn update_profile<E: Env + 'static>(
                 .unchanged()
             }
         }
-        Msg::Internal(Internal::ProfileChanged) => {
-            Effects::one(push_profile_to_storage::<E>(profile)).unchanged()
-        }
+        Msg::Internal(Internal::ProfileChanged) => mutation.notification::<E>(profile),
         Msg::Internal(Internal::InstallAddon(addon)) => {
-            install_addon::<E>(profile, addon, AddonRemoteWrite::Enabled)
+            install_addon::<E, _>(profile, addon, AddonRemoteWrite::Enabled, mutation)
         }
         Msg::Internal(Internal::InstallAddonLocal(addon)) => {
-            install_addon::<E>(profile, addon, AddonRemoteWrite::Disabled)
+            install_addon::<E, _>(profile, addon, AddonRemoteWrite::Disabled, mutation)
         }
         Msg::Internal(Internal::CtxAuthResult(auth_request, result)) => match (status, result) {
             (
@@ -242,7 +300,9 @@ pub fn update_profile<E: Env + 'static>(
                     },
                 };
                 if *profile != next_profile {
-                    *profile = next_profile;
+                    if !mutation.apply(profile, true, |profile| *profile = next_profile) {
+                        return Effects::none().unchanged();
+                    }
                     Effects::msg(Msg::Internal(Internal::ProfileChanged))
                 } else {
                     Effects::none().unchanged()
@@ -254,6 +314,13 @@ pub fn update_profile<E: Env + 'static>(
             APIRequest::AddonCollectionGet { auth_key, .. },
             result,
         )) if profile.auth_key() == Some(auth_key) => {
+            let changed = result
+                .as_ref()
+                .map(|addons| profile.addons != *addons)
+                .unwrap_or(false);
+            // The lock flag and addon contents are one admitted in-memory edit.
+            // Only the original addon-change arm requests profile persistence.
+            let next_locked = result.is_err();
             let profile_effects = match result {
                 Ok(addons) => {
                     let prev_transport_urls = profile
@@ -274,8 +341,6 @@ pub fn update_profile<E: Env + 'static>(
                         .chain(removed_transport_urls)
                         .collect();
                     let profile_changed_effects = if profile.addons != *addons {
-                        addons.clone_into(&mut profile.addons);
-
                         Effects::msg(Msg::Internal(Internal::ProfileChanged))
                     } else {
                         Effects::none().unchanged()
@@ -295,7 +360,16 @@ pub fn update_profile<E: Env + 'static>(
 
             // on successful AddonsApi result, unlock the addons if they have been locked
             // on failed AddonsApi result, lock the addons
-            profile.addons_locked = result.is_err();
+            if changed || profile.addons_locked != next_locked {
+                if !mutation.apply(profile, changed, |profile| {
+                    if let Ok(addons) = result {
+                        addons.clone_into(&mut profile.addons);
+                    }
+                    profile.addons_locked = next_locked;
+                }) {
+                    return Effects::none().unchanged();
+                }
+            }
             let addons_locked_event = Event::UserAddonsLocked {
                 addons_locked: profile.addons_locked,
             };
@@ -308,9 +382,13 @@ pub fn update_profile<E: Env + 'static>(
             result,
             overwritten,
         }) if *overwritten || profile.auth_key() == Some(auth_key) => match result {
-            Ok(user) => match &mut profile.auth {
+            Ok(user) => match &profile.auth {
                 Some(auth) if auth.user != *user => {
-                    user.clone_into(&mut auth.user);
+                    if !mutation.apply(profile, true, |profile| {
+                        user.clone_into(&mut profile.auth.as_mut().expect("checked auth").user);
+                    }) {
+                        return Effects::none().unchanged();
+                    }
                     Effects::msg(Msg::Event(Event::UserPulledFromAPI { uid: profile.uid() }))
                         .join(Effects::msg(Msg::Internal(Internal::ProfileChanged)))
                 }
@@ -318,10 +396,14 @@ pub fn update_profile<E: Env + 'static>(
                     let effects =
                         Effects::msg(Msg::Event(Event::UserPulledFromAPI { uid: profile.uid() }));
                     if *overwritten {
-                        profile.auth = Some(Auth {
-                            key: auth_key.clone(),
-                            user: user.clone(),
-                        });
+                        if !mutation.apply(profile, true, |profile| {
+                            profile.auth = Some(Auth {
+                                key: auth_key.clone(),
+                                user: user.clone(),
+                            });
+                        }) {
+                            return Effects::none().unchanged();
+                        }
 
                         effects.join(Effects::msg(Msg::Internal(Internal::ProfileChanged)))
                     } else {
@@ -404,10 +486,11 @@ fn addons_are_locked_for(remote_write: AddonRemoteWrite, profile: &Profile) -> b
     profile.addons_locked && remote_write == AddonRemoteWrite::Enabled
 }
 
-fn install_addon<E: Env + 'static>(
+fn install_addon<E: Env + 'static, M: ProfileMutation>(
     profile: &mut Profile,
     addon: &Descriptor,
     remote_write: AddonRemoteWrite,
+    mutation: &mut M,
 ) -> Effects {
     if addons_are_locked_for(remote_write, profile) {
         return addon_install_error_effects(addon, OtherError::UserAddonsAreLocked);
@@ -428,9 +511,17 @@ fn install_addon<E: Env + 'static>(
         if profile.addons[addon_position].flags.protected {
             return addon_install_error_effects(addon, OtherError::AddonIsProtected);
         }
-        addon.clone_into(&mut profile.addons[addon_position]);
+        if !mutation.apply(profile, true, |profile| {
+            addon.clone_into(&mut profile.addons[addon_position])
+        }) {
+            return Effects::none().unchanged();
+        }
     } else {
-        profile.addons.push(addon.to_owned());
+        if !mutation.apply(profile, true, |profile| {
+            profile.addons.push(addon.to_owned())
+        }) {
+            return Effects::none().unchanged();
+        }
     };
 
     Effects::msg(Msg::Event(Event::AddonInstalled {
@@ -441,11 +532,12 @@ fn install_addon<E: Env + 'static>(
     .join(Effects::msg(Msg::Internal(Internal::ProfileChanged)))
 }
 
-fn uninstall_addon<E: Env + 'static>(
+fn uninstall_addon<E: Env + 'static, M: ProfileMutation>(
     profile: &mut Profile,
     streams: &mut StreamsBucket,
     addon: &Descriptor,
     remote_write: AddonRemoteWrite,
+    mutation: &mut M,
 ) -> Effects {
     if addons_are_locked_for(remote_write, profile) {
         return addon_uninstall_error_effects(addon, OtherError::UserAddonsAreLocked);
@@ -460,7 +552,11 @@ fn uninstall_addon<E: Env + 'static>(
             return addon_uninstall_error_effects(addon, OtherError::AddonIsProtected);
         }
 
-        profile.addons.remove(addon_position);
+        if !mutation.apply(profile, true, |profile| {
+            profile.addons.remove(addon_position);
+        }) {
+            return Effects::none().unchanged();
+        }
 
         // Remove streams related to this addon. This deliberately preserves the existing action's
         // persistence behavior: profile storage is updated, while stream-bucket cleanup remains
@@ -480,10 +576,11 @@ fn uninstall_addon<E: Env + 'static>(
     }
 }
 
-fn upgrade_addon<E: Env + 'static>(
+fn upgrade_addon<E: Env + 'static, M: ProfileMutation>(
     profile: &mut Profile,
     addon: &Descriptor,
     remote_write: AddonRemoteWrite,
+    mutation: &mut M,
 ) -> Effects {
     if addons_are_locked_for(remote_write, profile) {
         return addon_upgrade_error_effects(addon, OtherError::UserAddonsAreLocked);
@@ -507,7 +604,11 @@ fn upgrade_addon<E: Env + 'static>(
         return addon_upgrade_error_effects(addon, OtherError::AddonIsProtected);
     }
 
-    addon.clone_into(&mut profile.addons[addon_position]);
+    if !mutation.apply(profile, true, |profile| {
+        addon.clone_into(&mut profile.addons[addon_position])
+    }) {
+        return Effects::none().unchanged();
+    }
     Effects::msg(Msg::Event(Event::AddonUpgraded {
         transport_url: addon.transport_url.to_owned(),
         id: addon.manifest.id.to_owned(),
@@ -516,12 +617,13 @@ fn upgrade_addon<E: Env + 'static>(
     .join(Effects::msg(Msg::Internal(Internal::ProfileChanged)))
 }
 
-fn replace_addon<E: Env + 'static>(
+fn replace_addon<E: Env + 'static, M: ProfileMutation>(
     profile: &mut Profile,
     streams: &mut StreamsBucket,
     old: &Descriptor,
     new: &Descriptor,
     remote_write: AddonRemoteWrite,
+    mutation: &mut M,
 ) -> Effects {
     if addons_are_locked_for(remote_write, profile) {
         return addon_upgrade_error_effects(new, OtherError::UserAddonsAreLocked);
@@ -552,7 +654,11 @@ fn replace_addon<E: Env + 'static>(
     }
 
     let old_transport_url = old_addon.transport_url.to_owned();
-    new.clone_into(&mut profile.addons[old_position]);
+    if !mutation.apply(profile, true, |profile| {
+        new.clone_into(&mut profile.addons[old_position])
+    }) {
+        return Effects::none().unchanged();
+    }
 
     let streams_changed = old_transport_url != new.transport_url;
     if streams_changed {
@@ -575,10 +681,11 @@ fn replace_addon<E: Env + 'static>(
     }
 }
 
-fn replace_addon_projection_local(
+fn replace_addon_projection_local<M: ProfileMutation>(
     profile: &mut Profile,
     streams: &mut StreamsBucket,
     addons: &[Descriptor],
+    mutation: &mut M,
 ) -> Effects {
     let mut projected_transport_urls = profile
         .addons
@@ -621,7 +728,9 @@ fn replace_addon_projection_local(
         .unchanged();
     }
 
-    profile.addons = next_addons;
+    if !mutation.apply(profile, true, |profile| profile.addons = next_addons) {
+        return Effects::none().unchanged();
+    }
     let streams_changed = streams.items.len();
     streams
         .items

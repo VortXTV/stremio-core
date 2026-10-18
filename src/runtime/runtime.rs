@@ -402,6 +402,22 @@ where
             prefix,
             direct,
         } = plan;
+        let effects: Vec<_> = effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                ScopedEffect {
+                    effect: ScopedEffectKind::CapturedPanic(panic),
+                    ..
+                } => {
+                    match work {
+                        WorkSink::Recorded { turn, .. } => turn.capture_panic(Some(panic)),
+                        WorkSink::Legacy => std::panic::resume_unwind(panic),
+                    }
+                    None
+                }
+                ordinary => Some(ordinary),
+            })
+            .collect();
         // This prefix is separately asserted already-admitted by the Model contract.
         // Pairing/UI rejection must not silently erase its pending durable work.
         if let Some(prefix) = prefix {
@@ -454,6 +470,9 @@ where
     ) {
         let ScopedEffect { effect, scope } = effect;
         match effect {
+            ScopedEffectKind::CapturedPanic(_) => {
+                unreachable!("captured panic extracted before output filters")
+            }
             ScopedEffectKind::LibraryUpdateThen(frame) => {
                 self.handle_library_frame(frame, scope, addon_context, work)
             }

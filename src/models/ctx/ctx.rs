@@ -109,8 +109,38 @@ impl Ctx {
 
 impl<E: Env + 'static> Update<E> for Ctx {
     fn update(&mut self, msg: &Msg) -> Effects {
-        match msg {
+        self.update_handoff::<E, _>(msg, &mut LegacyCtxHandoff)
+            .expect("Legacy Ctx handoff cannot refuse")
+    }
+}
+/// Backend-neutral substitution for the two governed reducers only. No scope,
+/// owner or account authority is minted by this public interface.
+pub trait CtxHandoff<E: Env + 'static> {
+    const RECORDED: bool;
+    fn begin_auth(&mut self, ctx: &mut Ctx, request: &AuthRequest) -> Result<(), ()>;
+    fn group(&mut self, ctx: &mut Ctx, msg: &Msg) -> Result<(Effects, Effects), ()>;
+}
+struct LegacyCtxHandoff;
+impl<E: Env + 'static> CtxHandoff<E> for LegacyCtxHandoff {
+    const RECORDED: bool = false;
+    fn begin_auth(&mut self, _: &mut Ctx, _: &AuthRequest) -> Result<(), ()> {
+        Ok(())
+    }
+    fn group(&mut self, ctx: &mut Ctx, msg: &Msg) -> Result<(Effects, Effects), ()> {
+        let profile = update_profile::<E>(&mut ctx.profile, &mut ctx.streams, &ctx.status, msg);
+        let library = update_library::<E>(&mut ctx.library, &ctx.profile, &ctx.status, msg);
+        Ok((profile, library))
+    }
+}
+impl Ctx {
+    pub fn update_handoff<E: Env + 'static, H: CtxHandoff<E>>(
+        &mut self,
+        msg: &Msg,
+        handoff: &mut H,
+    ) -> Result<Effects, ()> {
+        Ok(match msg {
             Msg::Action(Action::Ctx(ActionCtx::Authenticate(auth_request))) => {
+                handoff.begin_auth(self, auth_request)?;
                 self.status = CtxStatus::Loading(auth_request.to_owned());
                 Effects::one(authenticate::<E>(auth_request)).unchanged()
             }
@@ -119,16 +149,28 @@ impl<E: Env + 'static> Update<E> for Ctx {
             }
             Msg::Internal(Internal::Logout(deleted)) => {
                 let uid = self.profile.uid();
+                let original_key = if H::RECORDED {
+                    self.profile.auth_key().cloned()
+                } else {
+                    None
+                };
                 let session_effects = match self.profile.auth_key() {
-                    Some(auth_key) if !deleted => {
+                    Some(auth_key) if !deleted && !H::RECORDED => {
                         Effects::one(delete_session::<E>(auth_key)).unchanged()
                     }
                     _ => Effects::none().unchanged(),
                 };
-                let profile_effects =
-                    update_profile::<E>(&mut self.profile, &mut self.streams, &self.status, msg);
-                let library_effects =
-                    update_library::<E>(&mut self.library, &self.profile, &self.status, msg);
+                let (profile_effects, library_effects) = handoff.group(self, msg)?;
+                // Recorded refusal cannot construct a session API effect. On
+                // admission use the original key, never the new anonymous Ctx.
+                let session_effects = if H::RECORDED {
+                    match original_key.as_ref() {
+                        Some(key) if !deleted => Effects::one(delete_session::<E>(key)).unchanged(),
+                        _ => Effects::none().unchanged(),
+                    }
+                } else {
+                    session_effects
+                };
                 let streams_effects = update_streams::<E>(&mut self.streams, &self.status, msg);
                 let server_urls_effects = update_streaming_server_urls::<E>(
                     &mut self.streaming_server_urls,
@@ -167,10 +209,7 @@ impl<E: Env + 'static> Update<E> for Ctx {
                     .join(notifications_effects)
             }
             Msg::Internal(Internal::CtxAuthResult(auth_request, result)) => {
-                let profile_effects =
-                    update_profile::<E>(&mut self.profile, &mut self.streams, &self.status, msg);
-                let library_effects =
-                    update_library::<E>(&mut self.library, &self.profile, &self.status, msg);
+                let (profile_effects, library_effects) = handoff.group(self, msg)?;
                 let trakt_addon_effects = update_trakt_addon::<E>(
                     &mut self.trakt_addon,
                     &self.profile,
@@ -267,10 +306,7 @@ impl<E: Env + 'static> Update<E> for Ctx {
                     .join(ctx_effects)
             }
             _ => {
-                let profile_effects =
-                    update_profile::<E>(&mut self.profile, &mut self.streams, &self.status, msg);
-                let library_effects =
-                    update_library::<E>(&mut self.library, &self.profile, &self.status, msg);
+                let (profile_effects, library_effects) = handoff.group(self, msg)?;
                 let streams_effects = update_streams::<E>(&mut self.streams, &self.status, msg);
                 let server_urls_effects = update_streaming_server_urls::<E>(
                     &mut self.streaming_server_urls,
@@ -304,7 +340,7 @@ impl<E: Env + 'static> Update<E> for Ctx {
                     .join(search_history_effects)
                     .join(events_effects)
             }
-        }
+        })
     }
 }
 

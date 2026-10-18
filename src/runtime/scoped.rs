@@ -271,6 +271,10 @@ impl LibraryUpdateFrame {
 pub enum ScopedEffectKind {
     Ordinary(Effect),
     LibraryUpdateThen(LibraryUpdateFrame),
+    /// A recorded Model caught a reducer unwind only to preserve already
+    /// admitted prefix work. This is the original panic, NOT a storage outcome.
+    /// Runtime moves it into its caller-owned panic escrow before output filters.
+    CapturedPanic(Box<dyn Any + Send + 'static>),
 }
 pub struct ScopedEffect {
     pub effect: ScopedEffectKind,
