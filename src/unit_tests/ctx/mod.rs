@@ -1,11 +1,11 @@
 mod add_to_library;
 mod authenticate;
-mod reauthenticate;
 mod delete_account;
 mod install_addon;
 mod local_addon_actions;
 mod logout;
 mod mark_meta_item_as_watched;
+mod reauthenticate;
 mod update_events;
 mod notifications {
     mod update_notifications;
