@@ -2,6 +2,7 @@
 //! Frozen v2 d11 remains the direct-send negative control; this successor must be GREEN.
 //! Authority issuance below is an explicit TEST seam, NOT actual Owner/Unknown or Ctx policy.
 use super::*;
+use crate::runtime::{HandoffDisposition, HandoffReceipt, RecordedTask, SpawnRefusal, TaskOutcome};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -23,6 +24,8 @@ use crate::types::api::AuthRequest;
 use crate::types::profile::{Auth, AuthKey, User};
 
 thread_local! {
+    static RECORDED_EXECUTOR: RecordedExecutor = RecordedExecutor::new(recorded_spawn);
+    static RECEIPTS: RefCell<Vec<HandoffReceipt<RecordedTurn>>> = RefCell::new(vec![]);
     static SEQUENTIAL: RefCell<VecDeque<EnvFuture<'static, ()>>> = RefCell::new(VecDeque::new());
     static CONCURRENT: RefCell<VecDeque<EnvFuture<'static, ()>>> = RefCell::new(VecDeque::new());
     static READY: RefCell<Option<mpsc::Sender<()>>> = RefCell::new(None);
@@ -32,6 +35,9 @@ thread_local! {
 }
 struct DeliveryEnv;
 impl Env for DeliveryEnv {
+    fn recorded_executor() -> Option<RecordedExecutor> {
+        Some(RECORDED_EXECUTOR.with(Clone::clone))
+    }
     fn fetch<
         IN: Serialize + ConditionalSend + 'static,
         OUT: for<'de> Deserialize<'de> + ConditionalSend + 'static,
@@ -85,7 +91,49 @@ impl Env for DeliveryEnv {
         panic!("no logging")
     }
 }
+fn recorded_spawn(
+    kind: RecordedWorkKind,
+    task: RecordedTask<RecordedTurn>,
+) -> Result<(), SpawnRefusal> {
+    env_handoff_runtime_tests::spawn(kind, task)
+}
+fn handoff_turn(turn: RecordedTurn) {
+    let (operations, panics) = turn.into_parts();
+    for operation in operations {
+        let submitted = operation
+            .handoff()
+            .unwrap_or_else(|_| panic!("ordinal exhausted"));
+        assert_eq!(submitted.result.disposition, HandoffDisposition::Accepted);
+        assert!(submitted.result.panic.is_none());
+        RECEIPTS.with(|receipts| receipts.borrow_mut().push(submitted.result.receipt));
+    }
+    if let Some(panic) = panics.into_iter().next() {
+        std::panic::resume_unwind(panic);
+    }
+}
+fn collect_receipts() {
+    let receipts = RECEIPTS.with(|receipts| std::mem::take(&mut *receipts.borrow_mut()));
+    let mut first_panic = None;
+    for mut receipt in receipts {
+        match (&mut receipt).now_or_never() {
+            Some(TaskOutcome::Completed(turn)) => handoff_turn(turn),
+            Some(TaskOutcome::StartedPanicked(panic)) => {
+                if first_panic.is_none() {
+                    first_panic = Some(panic);
+                }
+            }
+            Some(_) => panic!("fixture task unexpectedly cancelled/refused"),
+            None => RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt)),
+        }
+    }
+    if let Some(panic) = first_panic {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn reset() {
+    env_handoff_runtime_tests::reset_controls();
+    RECEIPTS.with(|receipts| receipts.borrow_mut().clear());
     SEQUENTIAL.with(|queue| queue.borrow_mut().clear());
     CONCURRENT.with(|queue| queue.borrow_mut().clear());
     READY.with(|ready| drop(ready.borrow_mut().take()));
@@ -98,12 +146,14 @@ fn sequential_one() {
         .with(|queue| queue.borrow_mut().pop_front())
         .expect("sequential task");
     futures::executor::block_on(task);
+    collect_receipts();
 }
 fn concurrent_one() {
     let task = CONCURRENT
         .with(|queue| queue.borrow_mut().pop_front())
         .expect("completion waiter");
     futures::executor::block_on(task);
+    collect_receipts();
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,21 +399,22 @@ fn new_runtime(deferred: bool) -> (TestRuntime, TestRx, PendingSlot, ScopeToken)
     let pending = Arc::clone(&model.pending);
     let original = model.original.clone();
     let decline: DeclineReceiver = Arc::new(|_| {});
-    let (runtime, rx) = Runtime::new_recorded(
+    let (runtime, rx, turn) = Runtime::new_recorded(
         model,
         vec![],
         EffectScope::recorded(original.clone()),
         decline,
     )
     .unwrap_or_else(|_| panic!("recorded construction"));
+    handoff_turn(turn);
     (runtime, rx, pending, original)
 }
 fn begin(runtime: &TestRuntime, original: &ScopeToken, fenced: bool) {
-    runtime.handle_scheduled_effect_output(
+    handoff_turn(runtime.handle_recorded_effect_output(
         Msg::Internal(Internal::ProfileChanged),
         EffectScope::recorded(original.clone()),
         AddonEffectContext { epoch: 0, fenced },
-    );
+    ));
 }
 fn core_events<S: Stream<Item = RuntimeEvent<DeliveryEnv, Harness>> + Unpin>(
     rx: &mut S,
@@ -383,16 +434,16 @@ fn storage_event(event: &Event) -> bool {
         _ => false,
     }
 }
-fn action_locked(runtime: &TestRuntime, action: ActionCtx) {
+fn action_locked(runtime: &TestRuntime, action: ActionCtx, work: &mut WorkSink<'_>) {
     // Caller holds the actual Runtime transition. Use its actual plan/pair/traversal.
     let msg = Msg::Action(Action::Ctx(action));
     let (planned, scope) = runtime.plan_action_scoped(&msg, None);
     let context = planned.addon_context;
-    let direct = runtime.handle_invocation(planned, &msg, &scope);
+    let direct = runtime.handle_invocation_with_work(planned, &msg, &scope, work);
     runtime.finish_bare(msg, scope, direct, context);
 }
-fn adopt_locked(runtime: &TestRuntime, id: &str) {
-    action_locked(runtime, ActionCtx::Authenticate(request()));
+fn adopt_locked(runtime: &TestRuntime, id: &str, work: &mut WorkSink<'_>) {
+    action_locked(runtime, ActionCtx::Authenticate(request()), work);
     let scope = EffectScope::recorded(runtime.model.read().unwrap().original.clone());
     let msg = Msg::Internal(Internal::CtxAuthResult(
         request(),
@@ -402,13 +453,14 @@ fn adopt_locked(runtime: &TestRuntime, id: &str) {
             library_items_result: Ok(vec![]),
         }),
     ));
-    runtime.handle_effect_output_scoped(
+    runtime.handle_effect_output_scoped_with_work(
         msg,
         scope,
         AddonEffectContext {
             epoch: runtime.addon_epoch.load(Ordering::SeqCst),
             fenced: false,
         },
+        work,
     );
 }
 
@@ -461,26 +513,35 @@ fn race(deferred: bool, change: Change, fail: bool, fenced: bool) {
         (WRITES.with(Cell::get), SIBLINGS.with(Cell::get))
     });
     let (runtime, mut rx, original) = created_rx.recv().unwrap();
+    let mut control_turn = RecordedTurn::empty();
+    let mut work = WorkSink::Recorded {
+        turn: &mut control_turn,
+        executor: runtime.recorded_executor.as_ref().unwrap(),
+    };
     let transition = runtime.lock_transition();
     go_tx.send(()).unwrap();
     ready_rx.recv().unwrap(); // only before-transition readiness; NEVER wait for callback completion
     match change {
         Change::None => {}
-        Change::Switch => adopt_locked(&runtime, "B"),
+        Change::Switch => adopt_locked(&runtime, "B", &mut work),
         Change::Aba => {
-            adopt_locked(&runtime, "B");
-            adopt_locked(&runtime, "A");
+            adopt_locked(&runtime, "B", &mut work);
+            adopt_locked(&runtime, "A", &mut work);
         }
         Change::SameRequestRetry => {
-            action_locked(&runtime, ActionCtx::Authenticate(request()));
-            action_locked(&runtime, ActionCtx::Authenticate(request()));
+            action_locked(&runtime, ActionCtx::Authenticate(request()), &mut work);
+            action_locked(&runtime, ActionCtx::Authenticate(request()), &mut work);
             assert!(
                 matches!(&runtime.model.read().unwrap().ctx.status, CtxStatus::Loading(value) if value == &request())
             );
         }
         Change::AddonOnly => {
             let addons = runtime.model.read().unwrap().ctx.profile.addons.clone();
-            action_locked(&runtime, ActionCtx::ReplaceAddonProjectionLocal(addons));
+            action_locked(
+                &runtime,
+                ActionCtx::ReplaceAddonProjectionLocal(addons),
+                &mut work,
+            );
         }
     }
     let captures = runtime
@@ -492,6 +553,8 @@ fn race(deferred: bool, change: Change, fail: bool, fenced: bool) {
     let current = runtime.model.read().unwrap().current(&original);
     let should_deliver = current && (!fenced || !matches!(change, Change::AddonOnly));
     drop(transition);
+    drop(work);
+    handoff_turn(control_turn);
     assert_eq!(worker.join().unwrap(), (1, 1)); // ONLY after transition release
     assert_eq!(
         runtime
@@ -633,16 +696,18 @@ fn delivery_origin_d06_missing_validator_fails_closed_after_prefix_work() {
     reset();
     let model = NoDeliveryValidator(Harness::new(false));
     let scope = EffectScope::recorded(model.0.original.clone());
-    let (runtime, mut rx) = Runtime::new_recorded(model, vec![], scope.clone(), Arc::new(|_| {}))
-        .unwrap_or_else(|_| panic!("construction"));
-    runtime.handle_scheduled_effect_output(
+    let (runtime, mut rx, turn) =
+        Runtime::new_recorded(model, vec![], scope.clone(), Arc::new(|_| {}))
+            .unwrap_or_else(|_| panic!("construction"));
+    handoff_turn(turn);
+    handoff_turn(runtime.handle_recorded_effect_output(
         Msg::Internal(Internal::ProfileChanged),
         scope,
         AddonEffectContext {
             epoch: 0,
             fenced: false,
         },
-    );
+    ));
     sequential_one();
     sequential_one();
     assert_eq!(WRITES.with(Cell::get), 1); // admitted prefix was not discarded
@@ -702,16 +767,18 @@ fn delivery_origin_d07_two_logical_actual_producer_events_are_each_validated_onc
             }
             .boxed_env(),
         });
-        {
-            let _transition = runtime.lock_transition();
-            runtime.handle_effects(PlannedEffects {
-                plan,
-                addon_context: AddonEffectContext {
-                    epoch: 0,
-                    fenced: false,
+        handoff_turn(runtime.capture_recorded_turn(|work| {
+            runtime.handle_effects_with_work(
+                PlannedEffects {
+                    plan,
+                    addon_context: AddonEffectContext {
+                        epoch: 0,
+                        fenced: false,
+                    },
                 },
-            });
-        }
+                work,
+            );
+        }));
         sequential_one();
         if deferred {
             assert_eq!(
@@ -944,16 +1011,18 @@ fn delivery_origin_d12_last_upgraded_model_is_destroyed_after_outer_guards() {
             }
             .boxed_env(),
         });
-        {
-            let _transition = runtime.lock_transition();
-            runtime.handle_effects(PlannedEffects {
-                plan,
-                addon_context: AddonEffectContext {
-                    epoch: 0,
-                    fenced: true,
+        handoff_turn(runtime.capture_recorded_turn(|work| {
+            runtime.handle_effects_with_work(
+                PlannedEffects {
+                    plan,
+                    addon_context: AddonEffectContext {
+                        epoch: 0,
+                        fenced: true,
+                    },
                 },
-            });
-        }
+                work,
+            );
+        }));
         created_tx.send((runtime.clone(), rx)).unwrap();
         drop(runtime); // only main's handle remains; callback target is Weak
         start_rx.recv().unwrap();
@@ -1047,3 +1116,6 @@ fn delivery_origin_d13_external_leaf_closing_denies_initial_and_resolved_deliver
 
 #[path = "delivery_queue_tests.rs"]
 mod delivery_queue_tests;
+
+#[path = "env_handoff_runtime_tests.rs"]
+mod env_handoff_runtime_tests;

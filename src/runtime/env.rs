@@ -150,6 +150,12 @@ pub trait Env {
     fn set_storage<T: Serialize>(key: &str, value: Option<&T>) -> TryEnvFuture<()>;
     fn exec_concurrent<F: Future<Output = ()> + ConditionalSend + 'static>(future: F);
     fn exec_sequential<F: Future<Output = ()> + ConditionalSend + 'static>(future: F);
+    /// Explicit opt-in for recorded caller-owned outboxes. Default decline leaves
+    /// Legacy exec methods/API unchanged. Return the SAME lane capability for all
+    /// runtimes sharing a sequential executor; this method runs before construction.
+    fn recorded_executor() -> Option<crate::runtime::RecordedExecutor> {
+        None
+    }
     fn now() -> DateTime<Utc>;
     fn flush_analytics() -> EnvFuture<'static, ()>;
     fn analytics_context(

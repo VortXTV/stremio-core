@@ -2,6 +2,7 @@
 //! Admission is injected at the Model seam; this is NOT the private Owner/Unknown E01 gate.
 //! Place as runtime/scoped_dispatch_tests.rs and include as a child of runtime.rs.
 use super::*;
+use crate::runtime::{HandoffDisposition, HandoffReceipt, RecordedTask, SpawnRefusal, TaskOutcome};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -22,6 +23,8 @@ use crate::types::notifications::NotificationItem;
 use crate::types::resource::MetaItemPreview;
 
 thread_local! {
+    static RECORDED_EXECUTOR: RecordedExecutor = RecordedExecutor::new(recorded_spawn);
+    static RECEIPTS: RefCell<Vec<HandoffReceipt<RecordedTurn>>> = RefCell::new(vec![]);
     static QUEUE: RefCell<VecDeque<EnvFuture<'static, ()>>> = RefCell::new(VecDeque::new());
     static CONSTRUCTED: RefCell<Vec<String>> = RefCell::new(Vec::new());
     static EXECUTED: RefCell<Vec<String>> = RefCell::new(Vec::new());
@@ -30,6 +33,9 @@ thread_local! {
 
 struct RecordingEnv;
 impl Env for RecordingEnv {
+    fn recorded_executor() -> Option<RecordedExecutor> {
+        Some(RECORDED_EXECUTOR.with(Clone::clone))
+    }
     fn fetch<
         IN: Serialize + ConditionalSend + 'static,
         OUT: for<'de> Deserialize<'de> + ConditionalSend + 'static,
@@ -77,7 +83,49 @@ impl Env for RecordingEnv {
     }
 }
 
+fn recorded_spawn(
+    _: RecordedWorkKind,
+    task: RecordedTask<RecordedTurn>,
+) -> Result<(), SpawnRefusal> {
+    QUEUE.with(|queue| queue.borrow_mut().push_back(task.boxed_env()));
+    Ok(())
+}
+fn handoff_turn(turn: RecordedTurn) {
+    let (operations, panics) = turn.into_parts();
+    for operation in operations {
+        let submitted = operation
+            .handoff()
+            .unwrap_or_else(|_| panic!("ordinal exhausted"));
+        assert_eq!(submitted.result.disposition, HandoffDisposition::Accepted);
+        assert!(submitted.result.panic.is_none());
+        RECEIPTS.with(|receipts| receipts.borrow_mut().push(submitted.result.receipt));
+    }
+    if let Some(panic) = panics.into_iter().next() {
+        std::panic::resume_unwind(panic);
+    }
+}
+fn collect_receipts() {
+    let receipts = RECEIPTS.with(|receipts| std::mem::take(&mut *receipts.borrow_mut()));
+    let mut first_panic = None;
+    for mut receipt in receipts {
+        match (&mut receipt).now_or_never() {
+            Some(TaskOutcome::Completed(turn)) => handoff_turn(turn),
+            Some(TaskOutcome::StartedPanicked(panic)) => {
+                if first_panic.is_none() {
+                    first_panic = Some(panic);
+                }
+            }
+            Some(_) => panic!("fixture task unexpectedly cancelled/refused"),
+            None => RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt)),
+        }
+    }
+    if let Some(panic) = first_panic {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn reset_env() {
+    RECEIPTS.with(|receipts| receipts.borrow_mut().clear());
     QUEUE.with(|queue| queue.borrow_mut().clear());
     CONSTRUCTED.with(|keys| keys.borrow_mut().clear());
     EXECUTED.with(|trace| trace.borrow_mut().clear());
@@ -87,7 +135,10 @@ fn drain_queue() {
     loop {
         let task = QUEUE.with(|queue| queue.borrow_mut().pop_front());
         match task {
-            Some(task) => futures::executor::block_on(task),
+            Some(task) => {
+                futures::executor::block_on(task);
+                collect_receipts();
+            }
             None => break,
         }
     }
@@ -357,17 +408,27 @@ fn recorded(
     let capture = Arc::clone(&declined);
     let receiver: DeclineReceiver = Arc::new(move |input| capture.lock().unwrap().push(input));
     let scope = EffectScope::recorded(model.token.clone());
-    let (runtime, rx) = match Runtime::new_recorded(model, vec![], scope, receiver) {
+    let (runtime, rx, turn) = match Runtime::new_recorded(model, vec![], scope, receiver) {
         Ok(pair) => pair,
         Err(_) => panic!("fixture construction unexpectedly refused"),
     };
+    handoff_turn(turn);
     (runtime, rx, declined)
 }
 fn dispatch(runtime: &HarnessRuntime, action: ActionCtx) {
-    runtime.dispatch(RuntimeAction {
+    let action = RuntimeAction {
         action: Action::Ctx(action),
         field: None,
-    });
+    };
+    if runtime.declines.is_none() {
+        runtime.dispatch(action);
+    } else {
+        handoff_turn(
+            runtime
+                .dispatch_recorded(action)
+                .unwrap_or_else(|_| panic!("recorded dispatch")),
+        );
+    }
 }
 fn events<S: Stream<Item = RuntimeEvent<RecordingEnv, ActualCtxHarness>> + Unpin>(
     rx: &mut S,

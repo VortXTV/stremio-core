@@ -137,11 +137,13 @@ where
         &self,
         prefix: crate::runtime::LocalPrefix,
         addon: AddonEffectContext,
+        work: &mut WorkSink<'_>,
     ) {
-        // Only scoped recorded plans can carry LocalPrefix. Legacy new accepts Effect,
-        // never this plan type; no ordinary Legacy send/callback path changes here.
+        let WorkSink::Recorded { turn, executor } = work else {
+            panic!("LocalPrefix requires recorded caller-owned outbox");
+        };
         let (Some(tx), Some(live)) = (self.tx.recorded(), self.completion_lifetime.as_ref()) else {
-            return;
+            panic!("recorded prefix without recorded lifetime");
         };
         let target = CompletionTarget {
             model: Arc::downgrade(&self.model),
@@ -152,23 +154,47 @@ where
         };
         let cancelled = live.cancelled.clone();
         let original = prefix.origin;
-        // Existing consuming Env handoff remains a separately recorded SOURCE gap:
-        // rejecting/panicking implementations can destroy this future under transition.
-        E::exec_sequential(prefix.future.then(move |output| async move {
-            match output {
-                PrefixCompletion::Final(events) => target.deliver(events, original, addon),
-                PrefixCompletion::Pending(pending) => {
-                    // Move the ORIGINAL one-shot receiver/target/token/addon, once.
-                    // Sequential FIFO returns before pending resolution is awaited.
-                    E::exec_concurrent(async move {
-                        if let futures::future::Either::Left((Some(events), _)) =
-                            futures::future::select(Box::pin(pending.receive()), cancelled).await
-                        {
+        let observer_executor = RecordedExecutor::clone(*executor);
+        // No Env code or executor call here. The caller owns this exact outbox
+        // after the transition; prefix order is reserved before child/sibling work.
+        turn.push(
+            executor,
+            RecordedWorkKind::Sequential,
+            prefix
+                .future
+                .then(move |output| async move {
+                    match output {
+                        PrefixCompletion::Final(events) => {
                             target.deliver(events, original, addon);
+                            RecordedTurn::empty()
                         }
-                    });
-                }
-            }
-        }));
+                        PrefixCompletion::Pending(pending) => {
+                            // Return the ORIGINAL observer as owned follow-up work.
+                            // The sequential ticket completes without waiting for Unknown.
+                            // The caller receives this turn through the original task receipt.
+                            let mut turn = RecordedTurn::empty();
+                            turn.push(
+                                &observer_executor,
+                                RecordedWorkKind::CompletionObserver,
+                                async move {
+                                    if let futures::future::Either::Left((Some(events), _)) =
+                                        futures::future::select(
+                                            Box::pin(pending.receive()),
+                                            cancelled,
+                                        )
+                                        .await
+                                    {
+                                        target.deliver(events, original, addon);
+                                    }
+                                    RecordedTurn::empty()
+                                }
+                                .boxed_env(),
+                            );
+                            turn
+                        }
+                    }
+                })
+                .boxed_env(),
+        );
     }
 }

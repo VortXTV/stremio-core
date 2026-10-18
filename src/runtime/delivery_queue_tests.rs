@@ -62,11 +62,15 @@ fn delivery_origin_d14_real_receiver_wake_reenters_dispatch_and_preserves_order(
         let authority = Arc::clone(&runtime.model.read().unwrap().authority);
         let callback = register(&mut rx, move || {
             assert_unlocked(&reentrant, &authority);
-            reentrant.dispatch(RuntimeAction {
-                action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![])),
-                field: None,
-            });
-            reentrant.handle_scheduled_effect_output(
+            handoff_turn(
+                reentrant
+                    .dispatch_recorded(RuntimeAction {
+                        action: Action::Ctx(ActionCtx::ReplaceAddonProjectionLocal(vec![])),
+                        field: None,
+                    })
+                    .unwrap_or_else(|_| panic!("recorded reentry")),
+            );
+            handoff_turn(reentrant.handle_recorded_effect_output(
                 Msg::Event(Event::NotificationsDismissed {
                     id: "reentrant-after-commit".into(),
                 }),
@@ -75,7 +79,7 @@ fn delivery_origin_d14_real_receiver_wake_reenters_dispatch_and_preserves_order(
                     epoch: 0,
                     fenced: false,
                 },
-            );
+            ));
         });
         complete(deferred, &pending);
         assert_eq!(callback.calls.load(Ordering::SeqCst), 1);

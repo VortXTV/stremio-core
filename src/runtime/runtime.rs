@@ -7,6 +7,7 @@ use crate::runtime::{
     LibraryUpdateFrame, Model, ProtocolRejection, ScopeDrop, ScopedEffect, ScopedEffectKind,
     ScopedPlan,
 };
+use crate::runtime::{EnvFutureExt, RecordedExecutor, RecordedTurn, RecordedWorkKind};
 use derivative::Derivative;
 use futures::channel::mpsc::{channel, Receiver, Sender};
 use futures::FutureExt;
@@ -14,6 +15,7 @@ use futures::FutureExt;
 use futures::SinkExt;
 use serde::Serialize;
 use std::marker::PhantomData;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard};
 
@@ -45,6 +47,14 @@ struct PlannedEffects<F> {
 mod completion_delivery;
 use completion_delivery::CompletionLifetime;
 
+enum WorkSink<'a> {
+    Legacy,
+    Recorded {
+        turn: &'a mut RecordedTurn,
+        executor: &'a RecordedExecutor,
+    },
+}
+
 enum OutputTx<T> {
     Legacy(Sender<T>),
     Recorded(RecordedSender<T>),
@@ -75,6 +85,7 @@ pub struct Runtime<E: Env, M: Model<E>> {
     transition: Arc<Mutex<()>>,
     completion_lifetime: Option<Arc<CompletionLifetime>>,
     declines: Option<DeclineReceiver>,
+    recorded_executor: Option<RecordedExecutor>,
     #[cfg(test)]
     before_library_child: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     env: PhantomData<E>,
@@ -92,7 +103,7 @@ where
         buffer: usize,
     ) -> (Self, Receiver<RuntimeEvent<E, M>>) {
         let (tx, rx) = channel(buffer);
-        let runtime = Self::allocate(model, OutputTx::Legacy(tx), None);
+        let runtime = Self::allocate(model, OutputTx::Legacy(tx), None, None);
         {
             let _transition = runtime.lock_transition();
             let plan = ScopedPlan::ordinary(effects, vec![], &EffectScope::Legacy);
@@ -107,39 +118,55 @@ where
         (runtime, rx)
     }
 
-    /// Explicit source-unit opt-in. Failed construction returns all owned inputs intact.
-    /// This does not validate storage, hydrate an owner or activate a native backend.
+    /// Recorded-only source API. Default-deny Env capability; owned bootstrap
+    /// outbox is returned off guards and must be handed off by the caller.
     pub fn new_recorded(
         model: M,
         effects: Vec<ScopedEffect>,
         scope: EffectScope,
         declines: DeclineReceiver,
-    ) -> Result<(Self, RecordedReceiver<RuntimeEvent<E, M>>), (M, Vec<ScopedEffect>, EffectScope)>
-    {
+    ) -> Result<
+        (Self, RecordedReceiver<RuntimeEvent<E, M>>, RecordedTurn),
+        (M, Vec<ScopedEffect>, EffectScope),
+    > {
+        // Capability discovery is also outside all guards. A default decline or
+        // factory panic returns the still-owned bootstrap inputs, not a half Runtime.
+        let executor = match catch_unwind(AssertUnwindSafe(E::recorded_executor)) {
+            Ok(Some(executor)) => executor,
+            Ok(None) | Err(_) => return Err((model, effects, scope)),
+        };
         if !model.supports_recorded_dispatch() || scope.origin().is_none() {
             return Err((model, effects, scope));
         }
         let (tx, rx) = recorded_output::channel();
-        let runtime = Self::allocate(model, OutputTx::Recorded(tx), Some(declines));
-        {
-            let _transition = runtime.lock_transition();
+        let runtime = Self::allocate(
+            model,
+            OutputTx::Recorded(tx),
+            Some(declines),
+            Some(executor),
+        );
+        let turn = runtime.capture_recorded_turn(|work| {
             let mut plan = ScopedPlan::empty(&scope);
             plan.effects = effects;
-            runtime.handle_effects(PlannedEffects {
-                plan,
-                addon_context: AddonEffectContext {
-                    epoch: 0,
-                    fenced: false,
+            runtime.handle_effects_with_work(
+                PlannedEffects {
+                    plan,
+                    addon_context: AddonEffectContext {
+                        epoch: 0,
+                        fenced: false,
+                    },
                 },
-            });
-        }
-        Ok((runtime, rx))
+                work,
+            );
+        });
+        Ok((runtime, rx, turn))
     }
 
     fn allocate(
         model: M,
         tx: OutputTx<RuntimeEvent<E, M>>,
         declines: Option<DeclineReceiver>,
+        recorded_executor: Option<RecordedExecutor>,
     ) -> Self {
         let completion_lifetime = declines
             .as_ref()
@@ -151,6 +178,7 @@ where
             transition: Arc::new(Mutex::new(())),
             completion_lifetime,
             declines,
+            recorded_executor,
             env: PhantomData,
             #[cfg(test)]
             before_library_child: Arc::new(Mutex::new(None)),
@@ -169,6 +197,10 @@ where
     }
 
     pub fn dispatch(&self, action: RuntimeAction<E, M>) {
+        assert!(
+            self.declines.is_none(),
+            "recorded Runtime requires dispatch_recorded and owned outbox handling"
+        );
         let _transition = self.lock_transition();
         let RuntimeAction { action, field } = action;
         let msg = Msg::Action(action);
@@ -176,6 +208,57 @@ where
         let addon_context = planned.addon_context;
         let direct = self.handle_invocation(planned, &msg, &scope);
         self.finish_bare(msg, scope, direct, addon_context);
+    }
+
+    /// An unwired recorded caller must retain the returned turn. Legacy returns
+    /// its still-owned action unchanged; no model or executor is invoked.
+    pub fn dispatch_recorded(
+        &self,
+        action: RuntimeAction<E, M>,
+    ) -> Result<RecordedTurn, RuntimeAction<E, M>> {
+        if self.recorded_executor.is_none() {
+            return Err(action);
+        }
+        Ok(self.capture_recorded_turn(|work| {
+            let RuntimeAction { action, field } = action;
+            let msg = Msg::Action(action);
+            let (planned, scope) = self.plan_action_scoped(&msg, field.as_ref());
+            let addon_context = planned.addon_context;
+            let direct = self.handle_invocation_with_work(planned, &msg, &scope, work);
+            self.finish_bare(msg, scope, direct, addon_context);
+        }))
+    }
+
+    fn capture_recorded_turn(&self, apply: impl FnOnce(&mut WorkSink<'_>)) -> RecordedTurn {
+        // This owner is declared OUTSIDE the guarded/unwinding block. Already
+        // collected work survives a reducer/output-waker panic for caller recovery.
+        // Remaining ordinary plan/input destruction is a separate open source gap.
+        let mut turn = RecordedTurn::empty();
+        let executor = self
+            .recorded_executor
+            .as_ref()
+            .expect("recorded executor capability");
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut work = WorkSink::Recorded {
+                turn: &mut turn,
+                executor,
+            };
+            let _transition = self.lock_transition();
+            apply(&mut work);
+        }));
+        turn.capture_panic(result.err());
+        turn
+    }
+
+    fn handle_recorded_effect_output(
+        &self,
+        msg: Msg,
+        scope: EffectScope,
+        addon_context: AddonEffectContext,
+    ) -> RecordedTurn {
+        self.capture_recorded_turn(|work| {
+            self.handle_effect_output_scoped_with_work(msg, scope, addon_context, work)
+        })
     }
 
     fn plan_action_scoped(
@@ -264,7 +347,19 @@ where
 
     /// Bootstrap and preserved Legacy test entrypoint: no returned Model invocation.
     fn handle_effects(&self, planned: PlannedEffects<M::Field>) -> DirectOutcome {
-        self.deliver_plan(planned, None)
+        assert!(
+            self.declines.is_none(),
+            "recorded work requires caller-owned outbox"
+        );
+        self.handle_effects_with_work(planned, &mut WorkSink::Legacy)
+    }
+
+    fn handle_effects_with_work(
+        &self,
+        planned: PlannedEffects<M::Field>,
+        work: &mut WorkSink<'_>,
+    ) -> DirectOutcome {
+        self.deliver_plan(planned, None, work)
     }
 
     /// Every actual Model invocation pairs before its ordinary output is authorized.
@@ -274,13 +369,28 @@ where
         msg: &Msg,
         scope: &EffectScope,
     ) -> DirectOutcome {
-        self.deliver_plan(planned, Some((msg, scope)))
+        assert!(
+            self.declines.is_none(),
+            "recorded work requires caller-owned outbox"
+        );
+        self.handle_invocation_with_work(planned, msg, scope, &mut WorkSink::Legacy)
+    }
+
+    fn handle_invocation_with_work(
+        &self,
+        planned: PlannedEffects<M::Field>,
+        msg: &Msg,
+        scope: &EffectScope,
+        work: &mut WorkSink<'_>,
+    ) -> DirectOutcome {
+        self.deliver_plan(planned, Some((msg, scope)), work)
     }
 
     fn deliver_plan(
         &self,
         planned: PlannedEffects<M::Field>,
         invocation: Option<(&Msg, &EffectScope)>,
+        work: &mut WorkSink<'_>,
     ) -> DirectOutcome {
         let PlannedEffects {
             plan,
@@ -295,7 +405,7 @@ where
         // This prefix is separately asserted already-admitted by the Model contract.
         // Pairing/UI rejection must not silently erase its pending durable work.
         if let Some(prefix) = prefix {
-            self.enqueue_prefix(prefix, addon_context);
+            self.enqueue_prefix(prefix, addon_context, work);
         }
         let (direct, ordinary_allowed) = match invocation {
             Some((msg, scope)) if self.declines.is_some() => pair_direct(msg, scope, direct),
@@ -331,31 +441,58 @@ where
             }
         }
         for effect in effects {
-            self.handle_one(effect, addon_context);
+            self.handle_one(effect, addon_context, work);
         }
         direct
     }
 
-    fn handle_one(&self, effect: ScopedEffect, addon_context: AddonEffectContext) {
+    fn handle_one(
+        &self,
+        effect: ScopedEffect,
+        addon_context: AddonEffectContext,
+        work: &mut WorkSink<'_>,
+    ) {
         let ScopedEffect { effect, scope } = effect;
         match effect {
             ScopedEffectKind::LibraryUpdateThen(frame) => {
-                self.handle_library_frame(frame, scope, addon_context)
+                self.handle_library_frame(frame, scope, addon_context, work)
             }
             ScopedEffectKind::Ordinary(Effect::Msg(msg)) => {
-                self.handle_effect_output_scoped(*msg, scope, addon_context)
+                self.handle_effect_output_scoped_with_work(*msg, scope, addon_context, work)
             }
             ScopedEffectKind::Ordinary(Effect::Future(EffectFuture::Sequential(future))) => {
                 let runtime = self.clone();
-                E::exec_sequential(future.then(move |msg| async move {
-                    runtime.handle_scheduled_effect_output(msg, scope, addon_context);
-                }));
+                match work {
+                    WorkSink::Legacy => E::exec_sequential(future.then(move |msg| async move {
+                        runtime.handle_scheduled_effect_output(msg, scope, addon_context);
+                    })),
+                    WorkSink::Recorded { turn, executor } => turn.push(
+                        executor,
+                        RecordedWorkKind::Sequential,
+                        future
+                            .then(move |msg| async move {
+                                runtime.handle_recorded_effect_output(msg, scope, addon_context)
+                            })
+                            .boxed_env(),
+                    ),
+                }
             }
             ScopedEffectKind::Ordinary(Effect::Future(EffectFuture::Concurrent(future))) => {
                 let runtime = self.clone();
-                E::exec_concurrent(future.then(move |msg| async move {
-                    runtime.handle_scheduled_effect_output(msg, scope, addon_context);
-                }));
+                match work {
+                    WorkSink::Legacy => E::exec_concurrent(future.then(move |msg| async move {
+                        runtime.handle_scheduled_effect_output(msg, scope, addon_context);
+                    })),
+                    WorkSink::Recorded { turn, executor } => turn.push(
+                        executor,
+                        RecordedWorkKind::Concurrent,
+                        future
+                            .then(move |msg| async move {
+                                runtime.handle_recorded_effect_output(msg, scope, addon_context)
+                            })
+                            .boxed_env(),
+                    ),
+                }
             }
         }
     }
@@ -393,6 +530,25 @@ where
         scope: EffectScope,
         addon_context: AddonEffectContext,
     ) {
+        assert!(
+            self.declines.is_none(),
+            "recorded work requires caller-owned outbox"
+        );
+        self.handle_effect_output_scoped_with_work(
+            msg,
+            scope,
+            addon_context,
+            &mut WorkSink::Legacy,
+        );
+    }
+
+    fn handle_effect_output_scoped_with_work(
+        &self,
+        msg: Msg,
+        scope: EffectScope,
+        addon_context: AddonEffectContext,
+        work: &mut WorkSink<'_>,
+    ) {
         match msg {
             Msg::Event(event) => self.emit_core(event, addon_context),
             Msg::Internal(_) => {
@@ -401,7 +557,7 @@ where
                 }
                 let planned = self.plan_internal_scoped(&msg, &scope, addon_context);
                 let context = planned.addon_context;
-                let direct = self.handle_invocation(planned, &msg, &scope);
+                let direct = self.handle_invocation_with_work(planned, &msg, &scope, work);
                 self.finish_bare(msg, scope, direct, context);
             }
             Msg::Action(_) => panic!("effects are not allowed to resolve with action"),
@@ -468,6 +624,7 @@ where
         frame: LibraryUpdateFrame,
         scope: EffectScope,
         addon_context: AddonEffectContext,
+        work: &mut WorkSink<'_>,
     ) {
         let (item, continuation) = frame.into_parts();
         let valid = item.id == continuation.id();
@@ -484,7 +641,7 @@ where
         self.run_before_library_child();
         let planned = self.plan_internal_scoped(&msg, &scope, addon_context);
         let context = planned.addon_context;
-        let direct = self.handle_invocation(planned, &msg, &scope);
+        let direct = self.handle_invocation_with_work(planned, &msg, &scope, work);
         // pair_direct normalizes every rejected library invocation to its original
         // LibraryItem subject; no second, weaker frame-specific pairing rule.
         let outcome = match direct.kind {
@@ -494,7 +651,12 @@ where
         match outcome {
             AdmissionOutcome::AcceptedChange | AdmissionOutcome::AcceptedNoChange => {
                 for msg in continuation.accepted() {
-                    self.handle_effect_output_scoped(msg, scope.descendant(), context);
+                    self.handle_effect_output_scoped_with_work(
+                        msg,
+                        scope.descendant(),
+                        context,
+                        work,
+                    );
                 }
             }
             AdmissionOutcome::RefusedCurrent(reason) => {

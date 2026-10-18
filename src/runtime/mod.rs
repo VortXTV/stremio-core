@@ -15,6 +15,12 @@ pub use delivery_authority::*;
 mod recorded_output;
 pub use recorded_output::RecordedReceiver;
 
+mod handoff;
+pub use handoff::*;
+
+mod recorded_turn;
+pub use recorded_turn::*;
+
 mod env;
 pub use env::*;
 

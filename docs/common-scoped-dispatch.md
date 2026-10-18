@@ -79,10 +79,41 @@ The original old-test suffix remains present; the same 23 unrelated test-module
 entries were excluded only in disposable staging. A test-only Legacy-adapter
 dead-code warning remains visible in these narrowed builds, not suppressed.
 
-This is an unwired source milestone, not native activation. The consuming Env
-handoff can still reject, panic or drop a future while the transition is held;
-recoverable post-guard handoff remains required. Real Owner/borrowed-Ctx issuance,
+That 41-case milestone preceded the recoverable post-guard handoff below; it was
+not native activation. Real Owner/borrowed-Ctx issuance,
 Unknown publisher binding, ordinary payload destruction, shutdown/quiescence,
 queue/resource budgeting and whole-program/device performance remain open.
 No full upstream suite, SDK, app build, live-account operation or release result
 is claimed by these 41-case checks.
+
+## Recoverable Env handoff milestone
+
+Recorded planning now returns a caller-owned `RecordedTurn`; arbitrary executor
+submission and observation take place after the Runtime/Model/authority guards
+are released. `Env::recorded_executor` is an explicit optional capability whose
+default is `None`. The Legacy constructor/executor methods remain unchanged.
+Runtimes sharing a sequential executor must share the same lane capability.
+
+Each offered operation retains its original future in an escrow until acceptance.
+A refused or lost-before-start operation can return that exact unpolled future;
+an operation which started is never recovered as an unstarted retry. An eager
+executor, executor panic, or post-acceptance wake panic does not authorize duplicate
+execution. Callers must retain the non-cloneable receipt, pending operations and
+collected outputs outside application guards. Acceptance is not a storage ACK.
+Lane ordering prevents a later sibling from overtaking an earlier refused prefix;
+cancelling a middle ticket does not release the tail ahead of its predecessor.
+
+The exact source passed 58 named cases in separately fresh default and
+`env-future-send` source units: the prior 41 runtime/queue cases plus 11 escrow and
+six actual Runtime handoff cases. Each run had zero failed, ignored or filtered
+tests. The same 23 unrelated test-module entries were excluded only in disposable
+staging; original test bodies remain. A safe test-only observer was corrected
+after an initial default compilation failure; that failure is retained, not counted
+as a passing test. One Legacy-adapter dead-code warning remains visible per mode.
+
+These checks do not enable a native Env or validate its real recovery inbox. The
+host must provide independently runnable scheduling and retain every refusal,
+receipt and completed outbox. Private supervisor/native dependency integration,
+real Ctx/Owner/auth/storage authority, durable publication, teardown, bounded
+memory/latency, full upstream CI/MSRV and app/device behavior remain separate.
+No migration, live-account write, app/SDK build or release is established here.
